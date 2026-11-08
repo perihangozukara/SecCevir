@@ -19,6 +19,91 @@ using Microsoft.Win32;
 
 namespace SecCevir
 {
+    // Görünüm: lacivert + altın tema, logo ve Windows 11 pencere süsleri.
+    static class Theme
+    {
+        public static readonly Color Navy = Color.FromArgb(11, 26, 51);      // #0B1A33
+        public static readonly Color Navy2 = Color.FromArgb(22, 50, 92);     // #16325C
+        public static readonly Color Window = Color.FromArgb(15, 27, 46);    // #0F1B2E
+        public static readonly Color Box = Color.FromArgb(22, 37, 61);       // #16253D
+        public static readonly Color BoxRead = Color.FromArgb(19, 33, 56);   // #132138
+        public static readonly Color Hover = Color.FromArgb(30, 51, 84);     // #1E3354
+        public static readonly Color Gold = Color.FromArgb(201, 164, 92);    // #C9A45C
+        public static readonly Color GoldLight = Color.FromArgb(232, 207, 149); // #E8CF95
+        public static readonly Color GoldDim = Color.FromArgb(120, 100, 62);
+        public static readonly Color Muted = Color.FromArgb(159, 176, 200);  // #9FB0C8
+        public static readonly Color Faint = Color.FromArgb(111, 129, 156);  // #6F819C
+
+        [DllImport("dwmapi.dll")]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+        static extern int SetWindowTheme(IntPtr hwnd, string app, string idList);
+
+        // Kaydırma çubuklarını koyu yapar (Windows 10/11).
+        public static void DarkScroll(IntPtr h) { try { SetWindowTheme(h, "DarkMode_Explorer", null); } catch { } }
+
+        static int Ref(Color c) { return c.R | (c.G << 8) | (c.B << 16); }
+        static bool Set(IntPtr h, int attr, int v) { try { return DwmSetWindowAttribute(h, attr, ref v, 4) == 0; } catch { return false; } }
+
+        // Yuvarlak köşe + altın kenar (Windows 11). Olmazsa false döner; çağıran kenarı kendi çizer.
+        public static bool RoundWithBorder(IntPtr h)
+        {
+            bool ok = Set(h, 33, 2);           // DWMWA_WINDOW_CORNER_PREFERENCE = yuvarlak
+            ok &= Set(h, 34, Ref(Gold));       // DWMWA_BORDER_COLOR
+            return ok;
+        }
+
+        // Başlık çubuğu: koyu mod, lacivert zemin, altın yazı.
+        public static void TitleBar(IntPtr h)
+        {
+            Set(h, 20, 1);                     // DWMWA_USE_IMMERSIVE_DARK_MODE
+            Set(h, 35, Ref(Window));           // DWMWA_CAPTION_COLOR
+            Set(h, 36, Ref(GoldLight));        // DWMWA_TEXT_COLOR
+            Set(h, 34, Ref(GoldDim));          // DWMWA_BORDER_COLOR
+        }
+
+        public static System.Drawing.Drawing2D.GraphicsPath Rounded(float x, float y, float w, float h, float r)
+        {
+            var p = new System.Drawing.Drawing2D.GraphicsPath();
+            float d = r * 2;
+            p.AddArc(x, y, d, d, 180, 90);
+            p.AddArc(x + w - d, y, d, d, 270, 90);
+            p.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+            p.AddArc(x, y + h - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        // Logo: lacivert yuvarlak kare, ince altın çerçeve, altın tırnaklı "Ç".
+        public static Icon MakeIcon(int size)
+        {
+            using (Bitmap bmp = new Bitmap(size, size))
+            {
+                using (Graphics g = Graphics.FromImage(bmp))
+                using (StringFormat sf = new StringFormat())
+                {
+                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+                    g.Clear(Color.Transparent);
+                    float s = size;
+                    using (var bg = Rounded(0, 0, s - 1, s - 1, s * 0.22f))
+                    using (var br = new System.Drawing.Drawing2D.LinearGradientBrush(new PointF(0, 0), new PointF(s, s), Navy, Navy2))
+                        g.FillPath(br, bg);
+                    float m = s * 0.07f;
+                    using (var fr = Rounded(m, m, s - 1 - 2 * m, s - 1 - 2 * m, s * 0.16f))
+                    using (Pen pen = new Pen(Gold, Math.Max(1f, s / 26f)))
+                        g.DrawPath(pen, fr);
+                    sf.Alignment = StringAlignment.Center;
+                    sf.LineAlignment = StringAlignment.Center;
+                    using (Font f = new Font("Georgia", s * 0.6f, FontStyle.Bold, GraphicsUnit.Pixel))
+                    using (var tb = new System.Drawing.Drawing2D.LinearGradientBrush(new PointF(0, 0), new PointF(0, s), GoldLight, Gold))
+                        g.DrawString("Ç", f, tb, new RectangleF(0, -s * 0.04f, s, s), sf);
+                }
+                return Icon.FromHandle(bmp.GetHicon());
+            }
+        }
+    }
+
     static class Native
     {
         public const int WH_MOUSE_LL = 14;
@@ -279,7 +364,8 @@ namespace SecCevir
 
     class Popup : Form
     {
-        readonly Label spk, cpy, en, tr;
+        readonly Label head, spk, cpy, en, tr;
+        bool dwmBorder;
         readonly Timer cpyReset = new Timer();
         readonly float scale;
         Point anchor;
@@ -293,13 +379,19 @@ namespace SecCevir
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
             AutoScaleMode = AutoScaleMode.None;
-            BackColor = Color.FromArgb(32, 33, 36);
+            BackColor = Theme.Window;
             using (Graphics g = CreateGraphics()) scale = g.DpiX / 96f;
+
+            head = new Label();
+            head.Text = "SEÇ-ÇEVİR";
+            head.AutoSize = true;
+            head.Font = new Font("Segoe UI Semibold", 7.5f);
+            head.ForeColor = Theme.Gold;
 
             spk = new Label();
             spk.Text = "🔊";
-            spk.Font = new Font("Segoe UI Emoji", 12f);
-            spk.ForeColor = Color.FromArgb(138, 180, 248);
+            spk.Font = new Font("Segoe UI Emoji", 11f);
+            spk.ForeColor = Theme.Gold;
             spk.Cursor = Cursors.Hand;
             spk.TextAlign = ContentAlignment.MiddleCenter;
             spk.Size = new Size(S(30), S(26));
@@ -308,8 +400,8 @@ namespace SecCevir
             // Türkçe çeviriyi panoya kopyalar; kısa süre ✓ gösterir.
             cpy = new Label();
             cpy.Text = "📋";
-            cpy.Font = new Font("Segoe UI Emoji", 11f);
-            cpy.ForeColor = Color.FromArgb(138, 180, 248);
+            cpy.Font = new Font("Segoe UI Emoji", 10.5f);
+            cpy.ForeColor = Theme.Gold;
             cpy.Cursor = Cursors.Hand;
             cpy.TextAlign = ContentAlignment.MiddleCenter;
             cpy.Size = new Size(S(30), S(26));
@@ -323,12 +415,13 @@ namespace SecCevir
 
             en = new Label();
             en.Font = new Font("Segoe UI", 9.5f);
-            en.ForeColor = Color.FromArgb(170, 173, 178);
+            en.ForeColor = Theme.Muted;
 
             tr = new Label();
-            tr.Font = new Font("Segoe UI", 12f, FontStyle.Bold);
+            tr.Font = new Font("Segoe UI Semibold", 12.5f);
             tr.ForeColor = Color.White;
 
+            Controls.Add(head);
             Controls.Add(spk);
             Controls.Add(cpy);
             Controls.Add(en);
@@ -350,11 +443,21 @@ namespace SecCevir
             }
         }
 
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            dwmBorder = Theme.RoundWithBorder(Handle);
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
-            using (Pen p = new Pen(Color.FromArgb(95, 99, 104)))
-                e.Graphics.DrawRectangle(p, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
+            // Başlığın solundaki altın çizgi.
+            using (SolidBrush b = new SolidBrush(Theme.Gold))
+                e.Graphics.FillRectangle(b, S(12), head.Top + S(2), S(3), head.Height - S(4));
+            if (!dwmBorder)
+                using (Pen p = new Pen(Theme.Gold))
+                    e.Graphics.DrawRectangle(p, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
         }
 
         // at: seçimin altı; topY: seçimin üstü (altta yer yoksa popup oraya çıkar).
@@ -376,23 +479,28 @@ namespace SecCevir
 
         static Size Measure(Label l, int maxWidth)
         {
-            Size sz = TextRenderer.MeasureText(l.Text, l.Font, new Size(maxWidth, int.MaxValue),
-                TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
-            return new Size(sz.Width + 8, sz.Height + 4);
+            // Label'ın kendi ölçüsünü kullan; ayrı ölçüm son kelimeyi görünmeyen satıra itebiliyordu.
+            l.AutoSize = false;
+            Size sz = l.GetPreferredSize(new Size(maxWidth, 0));
+            return new Size(Math.Min(sz.Width, maxWidth) + 4, sz.Height + 2);
         }
 
         void Relayout()
         {
-            int p = S(10);
+            // Üst satır: altın çizgi + SEÇ-ÇEVİR, sağda 🔊 📋. Altında İngilizce (soluk), en altta Türkçe.
+            int p = S(12);
             en.UseMnemonic = false;
             tr.UseMnemonic = false;
-            spk.Location = new Point(p - S(4), p - S(4));
-            en.Size = Measure(en, S(430));
-            en.Location = new Point(spk.Right + S(4), p);
-            tr.Size = Measure(tr, S(440));
-            tr.Location = new Point(p, Math.Max(spk.Bottom, en.Bottom) + S(4));
-            cpy.Location = new Point(Math.Max(en.Right, tr.Right) + S(2), tr.Top);
-            ClientSize = new Size(cpy.Right + p - S(4), Math.Max(tr.Bottom, cpy.Bottom) + p);
+            head.Location = new Point(p + S(8), p);
+            en.Size = Measure(en, S(440));
+            tr.Size = Measure(tr, S(450));
+            int contentW = Math.Max(Math.Max(en.Width, tr.Width), head.Width + S(8) + 2 * S(30) + S(20));
+            en.Location = new Point(p - S(3), head.Bottom + S(6));
+            tr.Location = new Point(p - S(3), en.Bottom + S(2));
+            int right = p - S(3) + contentW;
+            cpy.Location = new Point(right - cpy.Width + S(6), p - S(7));
+            spk.Location = new Point(cpy.Left - spk.Width, cpy.Top);
+            ClientSize = new Size(right + p, tr.Bottom + p);
 
             Rectangle wa = Screen.FromPoint(anchor).WorkingArea;
             int x = Math.Max(wa.Left, Math.Min(anchor.X, wa.Right - Width));
@@ -441,7 +549,8 @@ namespace SecCevir
             TopMost = true;
             ShowInTaskbar = false;
             KeyPreview = true;
-            BackColor = Color.FromArgb(32, 33, 36);
+            BackColor = Theme.Window;
+            Icon = Theme.MakeIcon(32);
             using (Graphics g = CreateGraphics()) scale = g.DpiX / 96f;
 
             int p = S(12), w = S(440);
@@ -452,20 +561,25 @@ namespace SecCevir
             status.Size = new Size(w - S(122), S(20));
             natBtn = MakeButton("✨ Doğal yap", p + w - S(116), input.Bottom + S(4), S(116));
             natBtn.Height = S(28);
+            natBtn.BackColor = Theme.Gold;
+            natBtn.ForeColor = Theme.Navy;
+            natBtn.FlatAppearance.BorderColor = Theme.Gold;
+            natBtn.FlatAppearance.MouseOverBackColor = Theme.GoldLight;
+            natBtn.FlatAppearance.MouseDownBackColor = Theme.GoldLight;
             output = MakeBox(p, natBtn.Bottom + S(4), w, S(96), true);
             // Claude'un kısa Türkçe açıklaması (neyi neden değiştirdi).
             note = MakeLabel("", p, output.Bottom + S(4));
             note.AutoSize = false;
             note.Size = new Size(w, S(44));
             note.Font = new Font("Segoe UI", 9f);
-            note.ForeColor = Color.FromArgb(150, 190, 150);
+            note.ForeColor = Theme.GoldLight;
 
-            Button mic = MakeButton("🎤 Konuş", p, note.Bottom + S(6), S(100));
-            copyBtn = MakeButton("📋 Kopyala", mic.Right + S(8), mic.Top, S(116));
-            Button spk = MakeButton("🔊 Dinle", copyBtn.Right + S(8), copyBtn.Top, S(92));
+            Button mic = MakeButton("Konuş", p, note.Bottom + S(6), S(100));
+            copyBtn = MakeButton("Kopyala", mic.Right + S(8), mic.Top, S(116));
+            Button spk = MakeButton("Dinle", copyBtn.Right + S(8), copyBtn.Top, S(92));
             Button clr = MakeButton("Temizle", spk.Right + S(8), copyBtn.Top, S(92));
-            Label hint = MakeLabel("🎤 ya da Win+H: sesle yaz · Ctrl+Enter: kopyala ve kapat · Esc: kapat", p, copyBtn.Bottom + S(8));
-            hint.ForeColor = Color.FromArgb(128, 131, 136);
+            Label hint = MakeLabel("Konuş ya da Win+H: sesle yaz · Ctrl+Enter: kopyala ve kapat · Esc: kapat", p, copyBtn.Bottom + S(8));
+            hint.ForeColor = Theme.Faint;
             hint.Font = new Font("Segoe UI", 8.5f);
             ClientSize = new Size(w + 2 * p, hint.Bottom + p);
 
@@ -502,7 +616,7 @@ namespace SecCevir
             debounce.Tick += async delegate { debounce.Stop(); await DoTranslate(); };
             input.TextChanged += delegate { debounce.Stop(); debounce.Start(); };
             copyReset.Interval = 1500;
-            copyReset.Tick += delegate { copyReset.Stop(); copyBtn.Text = "📋 Kopyala"; };
+            copyReset.Tick += delegate { copyReset.Stop(); copyBtn.Text = "Kopyala"; };
 
             input.KeyDown += async delegate(object s, KeyEventArgs e)
             {
@@ -521,13 +635,19 @@ namespace SecCevir
 
         int S(int v) { return (int)Math.Round(v * scale); }
 
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            Theme.TitleBar(Handle);
+        }
+
         Label MakeLabel(string text, int x, int y)
         {
             Label l = new Label();
             l.Text = text;
             l.AutoSize = true;
             l.Font = new Font("Segoe UI", 9.5f);
-            l.ForeColor = Color.FromArgb(170, 173, 178);
+            l.ForeColor = Theme.Muted;
             l.Location = new Point(x, y);
             Controls.Add(l);
             return l;
@@ -538,12 +658,13 @@ namespace SecCevir
             TextBox t = new TextBox();
             t.Multiline = true;
             t.AcceptsReturn = true;
-            t.ScrollBars = ScrollBars.Vertical;
+            t.ScrollBars = ScrollBars.None; // tekerlekle kayar; beyaz çubuk görünmesin
             t.ReadOnly = readOnly;
             t.BorderStyle = BorderStyle.FixedSingle;
-            t.Font = new Font("Segoe UI", 11.5f, readOnly ? FontStyle.Bold : FontStyle.Regular);
-            t.BackColor = readOnly ? Color.FromArgb(41, 42, 45) : Color.FromArgb(48, 49, 52);
+            t.Font = new Font(readOnly ? "Segoe UI Semibold" : "Segoe UI", 11.5f);
+            t.BackColor = readOnly ? Theme.BoxRead : Theme.Box;
             t.ForeColor = Color.White;
+            t.HandleCreated += delegate { Theme.DarkScroll(t.Handle); };
             t.Location = new Point(x, y);
             t.Size = new Size(w, h);
             Controls.Add(t);
@@ -555,10 +676,12 @@ namespace SecCevir
             Button b = new Button();
             b.Text = text;
             b.FlatStyle = FlatStyle.Flat;
-            b.FlatAppearance.BorderColor = Color.FromArgb(95, 99, 104);
-            b.BackColor = Color.FromArgb(48, 49, 52);
+            b.FlatAppearance.BorderColor = Theme.GoldDim;
+            b.FlatAppearance.MouseOverBackColor = Theme.Hover;
+            b.FlatAppearance.MouseDownBackColor = Theme.Navy2;
+            b.BackColor = Theme.Box;
             b.ForeColor = Color.White;
-            b.Font = new Font("Segoe UI", 9.5f);
+            b.Font = new Font("Segoe UI Semibold", 9.5f);
             b.Location = new Point(x, y);
             b.Size = new Size(w, S(32));
             b.Cursor = Cursors.Hand;
@@ -592,7 +715,7 @@ namespace SecCevir
         void UpdateSpeakButton(Button b)
         {
             string st = speechState();
-            string t = st == "playing" ? "⏸ Duraklat" : st == "paused" ? "▶ Devam" : st == "loading" ? "⏳ Ses…" : "🔊 Dinle";
+            string t = st == "playing" ? "Duraklat" : st == "paused" ? "Devam" : st == "loading" ? "Ses…" : "Dinle";
             if (b.Text != t) b.Text = t;
         }
 
@@ -628,7 +751,7 @@ namespace SecCevir
         {
             if (output.Text.Length == 0) return false;
             if (!App.SetClipboardText(output.Text)) { status.Text = "Panoya yazılamadı; tekrar deneyin."; return false; }
-            copyBtn.Text = "✓ Kopyalandı";
+            copyBtn.Text = "Kopyalandı ✓";
             copyReset.Stop();
             copyReset.Start();
             return true;
@@ -769,20 +892,8 @@ namespace SecCevir
 
         static Icon MakeIcon()
         {
-            using (Bitmap bmp = new Bitmap(32, 32))
-            {
-                using (Graphics g = Graphics.FromImage(bmp))
-                using (Font f = new Font("Segoe UI", 13f, FontStyle.Bold, GraphicsUnit.Pixel))
-                using (StringFormat sf = new StringFormat())
-                {
-                    sf.Alignment = StringAlignment.Center;
-                    sf.LineAlignment = StringAlignment.Center;
-                    g.Clear(Color.FromArgb(26, 115, 232));
-                    g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
-                    g.DrawString("TR", f, Brushes.White, new RectangleF(0, 0, 32, 32), sf);
-                }
-                return Icon.FromHandle(bmp.GetHicon());
-            }
+            int size = Math.Max(16, SystemInformation.SmallIconSize.Width);
+            return Theme.MakeIcon(size);
         }
 
         static bool IsAutoStart()
@@ -886,31 +997,59 @@ namespace SecCevir
             return false;
         }
 
-        // Terminaldeki seçimi okur. Önce pano: terminal seçimi kendisi kopyaladıysa
-        // (Git Bash, PuTTY, Windows Terminal'de "copyOnSelect") oradan alınır.
-        // Değilse UI Automation ile doğrudan okunur. Pano eski haline döndürülmez,
-        // çünkü kopyalamayı terminal kendisi yaptı.
+        // Terminaldeki seçimi okur. İki yol aynı anda denenir:
+        // - UI Automation: Windows Terminal'in kendi seçimi (hemen başlar).
+        // - Pano: terminal ya da içinde çalışan program (ör. Claude Code) seçimi kendisi
+        //   kopyalayabilir; bu bazen bir saniyeye kadar gecikir, o yüzden 1,5 sn beklenir.
+        // Pano eski haline döndürülmez, çünkü kopyalamayı terminal kendisi yaptı.
         async Task<string> ReadTerminalSelection(Point pt)
         {
-            for (int i = 0; i < 8; i++)
+            Task<string> uia = Task.Run(delegate { return UiaReader.ReadSelection(pt, MaxChars * 2); });
+            bool uiaChecked = false;
+            DateTime until = DateTime.UtcNow.AddMilliseconds(1500);
+            while (true)
             {
                 if (Native.GetClipboardSequenceNumber() != seqAtDown)
                 {
-                    for (int j = 0; j < 6; j++)
-                    {
-                        try { if (Clipboard.ContainsText()) { Debug("terminal: panodan"); return Clipboard.GetText(); } }
-                        catch { }
-                        await Task.Delay(40);
-                    }
-                    break;
+                    string c = await ReadClipboardText();
+                    if (!string.IsNullOrEmpty(c)) { Debug("terminal: panodan"); return c; }
                 }
-                await Task.Delay(30);
+                if (!uiaChecked && uia.IsCompleted)
+                {
+                    uiaChecked = true;
+                    string s = uia.Status == TaskStatus.RanToCompletion ? uia.Result : null;
+                    if (!string.IsNullOrEmpty(s)) { Debug("terminal: UI Automation"); return s; }
+                }
+                if (DateTime.UtcNow >= until) break;
+                await Task.Delay(40);
             }
+            Log("terminal: pano değişmedi, UI Automation " + (uia.IsCompleted ? "boş döndü" : "yanıt vermedi"));
+            return null;
+        }
 
-            Task<string> t = Task.Run(delegate { return UiaReader.ReadSelection(pt, MaxChars * 2); });
-            if (await Task.WhenAny(t, Task.Delay(2000)) != t) { Log("atlandı: terminal seçimi zamanında okunamadı"); return null; }
-            if (!string.IsNullOrEmpty(t.Result)) Debug("terminal: UI Automation");
-            return t.Result;
+        static async Task<string> ReadClipboardText()
+        {
+            for (int j = 0; j < 6; j++)
+            {
+                try { if (Clipboard.ContainsText()) return Clipboard.GetText(); }
+                catch { }
+                await Task.Delay(40);
+            }
+            return null;
+        }
+
+        // Metindeki Türkçeye özgü harflerin oranı. İngilizce bir metinde tek bir Türkçe
+        // ad (ör. bir yer ya da dosya adı) geçmesi metni Türkçe yapmaz.
+        static bool LooksTurkish(string text)
+        {
+            int letters = 0, tr = 0;
+            foreach (char c in text)
+            {
+                if (!char.IsLetter(c)) continue;
+                letters++;
+                if ("çÇğĞıİöÖşŞüÜ".IndexOf(c) >= 0) tr++;
+            }
+            return letters > 0 && tr * 100 >= letters * 2; // en az %2
         }
 
         static bool KeyDown(int vk) { return (Native.GetAsyncKeyState(vk) & 0x8000) != 0; }
@@ -944,6 +1083,7 @@ namespace SecCevir
                 {
                     text = await ReadTerminalSelection(upPt);
                     if (string.IsNullOrEmpty(text)) { Log("atlandı: terminalde seçim okunamadı (" + cls + ")"); return; }
+                    Log("terminal: seçim okundu (" + text.Length + " karakter)");
                 }
                 else
                 {
@@ -964,9 +1104,9 @@ namespace SecCevir
 
             text = Regex.Replace(text, @"\s+", " ").Trim();
             Debug("kopyalandı: " + text.Length + " karakter");
-            if (text.Length == 0 || !Regex.IsMatch(text, "[A-Za-z]")) return;
-            // ğ, ı, ş, İ yalnızca Türkçede geçer: metin zaten Türkçe, çevirmeye gerek yok.
-            if (Regex.IsMatch(text, "[ğĞıİşŞ]")) { Debug("atlandı: Türkçe harf var"); return; }
+            if (text.Length == 0 || !Regex.IsMatch(text, "[A-Za-z]")) { Log("atlandı: seçimde harf yok"); return; }
+            // Türkçe harfler çoksa metin zaten Türkçedir, çevirmeye gerek yok.
+            if (LooksTurkish(text)) { Log("atlandı: metin Türkçe görünüyor (" + text.Length + " karakter)"); return; }
 
             bool cut = text.Length > MaxChars;
             if (cut) text = text.Substring(0, MaxChars);
@@ -1001,6 +1141,7 @@ namespace SecCevir
                 if (res[1] == "tr")
                 {
                     // Metin zaten Türkçeymiş: popup'ı kapat.
+                    Log("atlandı: Google metni Türkçe saydı");
                     if (id == requestId) popup.Hide();
                     return;
                 }

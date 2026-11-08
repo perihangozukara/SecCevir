@@ -1,6 +1,9 @@
-// Seç-Çevir: ekranda fareyle seçilen İngilizce metnin Türkçesini seçimin altında gösterir.
+﻿// Seç-Çevir: ekranda fareyle seçilen İngilizce metnin Türkçesini seçimin altında gösterir.
+// Terminallerde tuş göndermeden çalışır. Simgeye tıklayınca (ya da Ctrl+Alt+T) açılan
+// Yaz-Çevir penceresinde Türkçe yazılan cümlenin İngilizcesi çıkar ve kopyalanır.
 // Derleme: derle.bat
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
@@ -75,6 +78,17 @@ namespace SecCevir
             INPUT[] seq = { Key(0x11, false), Key(0x43, false), Key(0x43, true), Key(0x11, true) };
             return SendInput((uint)seq.Length, seq, Marshal.SizeOf(typeof(INPUT))) == seq.Length;
         }
+
+        // Win+H: Windows'un sesle yazma (voice typing) panelini açar. Söylenen yazı
+        // o an odaktaki kutuya yazılır. Win tuşu "genişletilmiş tuş" olarak gönderilir.
+        public static bool SendWinH()
+        {
+            INPUT winDown = Key(0x5B, false), winUp = Key(0x5B, true);
+            winDown.u.ki.dwFlags |= 1u; // KEYEVENTF_EXTENDEDKEY
+            winUp.u.ki.dwFlags |= 1u;
+            INPUT[] seq = { winDown, Key(0x48, false), Key(0x48, true), winUp };
+            return SendInput((uint)seq.Length, seq, Marshal.SizeOf(typeof(INPUT))) == seq.Length;
+        }
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -108,6 +122,88 @@ namespace SecCevir
         public static extern UIntPtr SetTimer(IntPtr hWnd, UIntPtr id, uint ms, IntPtr proc);
         [DllImport("kernel32.dll")]
         public static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+        [DllImport("user32.dll")]
+        public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
+        [DllImport("user32.dll")]
+        public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        public const int WM_HOTKEY = 0x312;
+        public const uint MOD_ALT = 1, MOD_CONTROL = 2, MOD_NOREPEAT = 0x4000;
+    }
+
+    // Her yerden çalışan kısayol tuşu (Ctrl+Alt+T). Başka bir program aynı tuşu
+    // almışsa kurulamaz; o zaman yalnızca simgeye tıklamak çalışır.
+    class HotkeyWindow : NativeWindow
+    {
+        readonly Action onPress;
+        public readonly bool Ok;
+
+        public HotkeyWindow(Action onPress)
+        {
+            this.onPress = onPress;
+            CreateHandle(new CreateParams());
+            Ok = Native.RegisterHotKey(Handle, 1, Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_NOREPEAT, (uint)Keys.T);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == Native.WM_HOTKEY) { try { onPress(); } catch { } }
+            base.WndProc(ref m);
+        }
+
+        public void Dispose()
+        {
+            if (Ok) Native.UnregisterHotKey(Handle, 1);
+            DestroyHandle();
+        }
+    }
+
+    // Terminalde seçili yazıyı UI Automation ile okur (ekran okuyucuların kullandığı yol).
+    // Hiç tuş göndermez, panoya dokunmaz; bu yüzden çalışan komut kesilmez.
+    static class UiaReader
+    {
+        public static string ReadSelection(Point pt, int maxChars)
+        {
+            string s = null;
+            try
+            {
+                s = FromElement(System.Windows.Automation.AutomationElement.FromPoint(
+                    new System.Windows.Point(pt.X, pt.Y)), maxChars);
+            }
+            catch { }
+            if (string.IsNullOrEmpty(s))
+            {
+                try { s = FromElement(System.Windows.Automation.AutomationElement.FocusedElement, maxChars); }
+                catch { }
+            }
+            return s;
+        }
+
+        // Fare altındaki öğe metin alanının bir parçası olabilir; birkaç üst öğeye bak.
+        static string FromElement(System.Windows.Automation.AutomationElement el, int maxChars)
+        {
+            for (int depth = 0; el != null && depth < 5; depth++)
+            {
+                object p;
+                if (el.TryGetCurrentPattern(System.Windows.Automation.TextPattern.Pattern, out p))
+                {
+                    System.Windows.Automation.Text.TextPatternRange[] ranges =
+                        ((System.Windows.Automation.TextPattern)p).GetSelection();
+                    StringBuilder sb = new StringBuilder();
+                    if (ranges != null)
+                        foreach (System.Windows.Automation.Text.TextPatternRange r in ranges)
+                        {
+                            sb.Append(r.GetText(maxChars)).Append(' ');
+                            if (sb.Length > maxChars) break;
+                        }
+                    string s = sb.ToString().Trim();
+                    if (s.Length > 0) return s;
+                }
+                el = System.Windows.Automation.TreeWalker.ControlViewWalker.GetParent(el);
+            }
+            return null;
+        }
     }
 
     // Fare kancası kendi iş parçacığında (thread) çalışır. Kanca arayüzün iş parçacığında
@@ -183,7 +279,8 @@ namespace SecCevir
 
     class Popup : Form
     {
-        readonly Label spk, en, tr;
+        readonly Label spk, cpy, en, tr;
+        readonly Timer cpyReset = new Timer();
         readonly float scale;
         Point anchor;
         int aboveY;
@@ -208,6 +305,22 @@ namespace SecCevir
             spk.Size = new Size(S(30), S(26));
             spk.Click += delegate { if (SpeakClicked != null) SpeakClicked(this, EventArgs.Empty); };
 
+            // Türkçe çeviriyi panoya kopyalar; kısa süre ✓ gösterir.
+            cpy = new Label();
+            cpy.Text = "📋";
+            cpy.Font = new Font("Segoe UI Emoji", 11f);
+            cpy.ForeColor = Color.FromArgb(138, 180, 248);
+            cpy.Cursor = Cursors.Hand;
+            cpy.TextAlign = ContentAlignment.MiddleCenter;
+            cpy.Size = new Size(S(30), S(26));
+            cpy.Click += delegate
+            {
+                if (tr.Text.Length == 0 || tr.Text == "…") return;
+                if (App.SetClipboardText(tr.Text)) { cpy.Text = "✓"; cpyReset.Start(); }
+            };
+            cpyReset.Interval = 1200;
+            cpyReset.Tick += delegate { cpyReset.Stop(); cpy.Text = "📋"; };
+
             en = new Label();
             en.Font = new Font("Segoe UI", 9.5f);
             en.ForeColor = Color.FromArgb(170, 173, 178);
@@ -217,6 +330,7 @@ namespace SecCevir
             tr.ForeColor = Color.White;
 
             Controls.Add(spk);
+            Controls.Add(cpy);
             Controls.Add(en);
             Controls.Add(tr);
         }
@@ -275,9 +389,10 @@ namespace SecCevir
             spk.Location = new Point(p - S(4), p - S(4));
             en.Size = Measure(en, S(430));
             en.Location = new Point(spk.Right + S(4), p);
-            tr.Size = Measure(tr, S(470));
+            tr.Size = Measure(tr, S(440));
             tr.Location = new Point(p, Math.Max(spk.Bottom, en.Bottom) + S(4));
-            ClientSize = new Size(Math.Max(en.Right, tr.Right) + p, tr.Bottom + p);
+            cpy.Location = new Point(Math.Max(en.Right, tr.Right) + S(2), tr.Top);
+            ClientSize = new Size(cpy.Right + p - S(4), Math.Max(tr.Bottom, cpy.Bottom) + p);
 
             Rectangle wa = Screen.FromPoint(anchor).WorkingArea;
             int x = Math.Max(wa.Left, Math.Min(anchor.X, wa.Right - Width));
@@ -285,6 +400,262 @@ namespace SecCevir
             if (y + Height > wa.Bottom) y = Math.Max(wa.Top, aboveY - Height);
             Location = new Point(x, y);
             Invalidate();
+        }
+    }
+
+    // Yaz-Çevir: Türkçe yazılan metnin İngilizcesini çıkarır (İngilizce yazılırsa Türkçesini).
+    // Yazmayı bırakınca kendiliğinden çevirir. Ctrl+Enter: kopyala ve kapat. Esc: kapat.
+    class WriteForm : Form
+    {
+        readonly TextBox input, output;
+        readonly Label status;
+        readonly Button copyBtn;
+        readonly Timer debounce = new Timer();
+        readonly Timer copyReset = new Timer();
+        readonly Func<string, Task<string[]>> translate; // dönüş: [çeviri, yön yazısı, hedef dil]
+        readonly Func<string, string, Task<string[]>> naturalize; // (yazılan, Google çevirisi) → [doğal İngilizce, Türkçe not]
+        readonly Action<string, string> speak;
+        readonly Func<string> speechState;
+        readonly Action pauseSpeech, resumeSpeech;
+        readonly Timer speechPoll = new Timer();
+        readonly Label note;
+        readonly Button natBtn;
+        readonly float scale;
+        int req;
+        string doneFor = "";
+        string outLang = "en";
+
+        public WriteForm(Func<string, Task<string[]>> translate, Func<string, string, Task<string[]>> naturalize,
+                         Action<string, string> speak, Func<string> speechState, Action pauseSpeech, Action resumeSpeech)
+        {
+            this.translate = translate;
+            this.naturalize = naturalize;
+            this.speak = speak;
+            this.speechState = speechState;
+            this.pauseSpeech = pauseSpeech;
+            this.resumeSpeech = resumeSpeech;
+            Text = "Yaz-Çevir";
+            FormBorderStyle = FormBorderStyle.FixedToolWindow;
+            StartPosition = FormStartPosition.Manual;
+            AutoScaleMode = AutoScaleMode.None;
+            TopMost = true;
+            ShowInTaskbar = false;
+            KeyPreview = true;
+            BackColor = Color.FromArgb(32, 33, 36);
+            using (Graphics g = CreateGraphics()) scale = g.DpiX / 96f;
+
+            int p = S(12), w = S(440);
+            Label lin = MakeLabel("Türkçe yazın:", p, p);
+            input = MakeBox(p, lin.Bottom + S(2), w, S(96), false);
+            status = MakeLabel("", p, input.Bottom + S(8));
+            status.AutoSize = false;
+            status.Size = new Size(w - S(122), S(20));
+            natBtn = MakeButton("✨ Doğal yap", p + w - S(116), input.Bottom + S(4), S(116));
+            natBtn.Height = S(28);
+            output = MakeBox(p, natBtn.Bottom + S(4), w, S(96), true);
+            // Claude'un kısa Türkçe açıklaması (neyi neden değiştirdi).
+            note = MakeLabel("", p, output.Bottom + S(4));
+            note.AutoSize = false;
+            note.Size = new Size(w, S(44));
+            note.Font = new Font("Segoe UI", 9f);
+            note.ForeColor = Color.FromArgb(150, 190, 150);
+
+            Button mic = MakeButton("🎤 Konuş", p, note.Bottom + S(6), S(100));
+            copyBtn = MakeButton("📋 Kopyala", mic.Right + S(8), mic.Top, S(116));
+            Button spk = MakeButton("🔊 Dinle", copyBtn.Right + S(8), copyBtn.Top, S(92));
+            Button clr = MakeButton("Temizle", spk.Right + S(8), copyBtn.Top, S(92));
+            Label hint = MakeLabel("🎤 ya da Win+H: sesle yaz · Ctrl+Enter: kopyala ve kapat · Esc: kapat", p, copyBtn.Bottom + S(8));
+            hint.ForeColor = Color.FromArgb(128, 131, 136);
+            hint.Font = new Font("Segoe UI", 8.5f);
+            ClientSize = new Size(w + 2 * p, hint.Bottom + p);
+
+            // Yazı kutusuna odaklan, sonra Windows'un sesle yazma panelini aç. Söylenen
+            // yazı kutuya düştükçe çeviri kendiliğinden yapılır.
+            mic.Click += delegate
+            {
+                Activate();
+                input.Focus();
+                input.SelectionStart = input.TextLength;
+                BeginInvoke(new Action(delegate
+                {
+                    if (!Native.SendWinH()) status.Text = "Sesle yazma açılamadı; Win+H tuşlarına kendiniz basın.";
+                    else status.Text = "Konuşun… (Windows sesle yazma; bitince panelden durdurun)";
+                }));
+            };
+            natBtn.Click += async delegate { await DoNaturalize(); };
+            copyBtn.Click += delegate { CopyOutput(); };
+            // Tek düğme: çalarken Duraklat, duraklatılmışken Devam, yoksa baştan Dinle.
+            spk.Click += delegate
+            {
+                string st = speechState();
+                if (st == "playing") pauseSpeech();
+                else if (st == "paused") resumeSpeech();
+                else if (st == "stopped" && output.Text.Length > 0) speak(output.Text, outLang);
+                UpdateSpeakButton(spk);
+            };
+            speechPoll.Interval = 250;
+            speechPoll.Tick += delegate { if (Visible) UpdateSpeakButton(spk); };
+            speechPoll.Start();
+            clr.Click += delegate { input.Clear(); output.Clear(); status.Text = ""; doneFor = ""; input.Focus(); };
+
+            debounce.Interval = 600;
+            debounce.Tick += async delegate { debounce.Stop(); await DoTranslate(); };
+            input.TextChanged += delegate { debounce.Stop(); debounce.Start(); };
+            copyReset.Interval = 1500;
+            copyReset.Tick += delegate { copyReset.Stop(); copyBtn.Text = "📋 Kopyala"; };
+
+            input.KeyDown += async delegate(object s, KeyEventArgs e)
+            {
+                if (e.Control && e.KeyCode == Keys.A) { input.SelectAll(); e.SuppressKeyPress = true; }
+                else if (e.Control && e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; await CopyAndClose(); }
+            };
+            output.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.Control && e.KeyCode == Keys.A) { output.SelectAll(); e.SuppressKeyPress = true; }
+            };
+            KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; Hide(); }
+            };
+        }
+
+        int S(int v) { return (int)Math.Round(v * scale); }
+
+        Label MakeLabel(string text, int x, int y)
+        {
+            Label l = new Label();
+            l.Text = text;
+            l.AutoSize = true;
+            l.Font = new Font("Segoe UI", 9.5f);
+            l.ForeColor = Color.FromArgb(170, 173, 178);
+            l.Location = new Point(x, y);
+            Controls.Add(l);
+            return l;
+        }
+
+        TextBox MakeBox(int x, int y, int w, int h, bool readOnly)
+        {
+            TextBox t = new TextBox();
+            t.Multiline = true;
+            t.AcceptsReturn = true;
+            t.ScrollBars = ScrollBars.Vertical;
+            t.ReadOnly = readOnly;
+            t.BorderStyle = BorderStyle.FixedSingle;
+            t.Font = new Font("Segoe UI", 11.5f, readOnly ? FontStyle.Bold : FontStyle.Regular);
+            t.BackColor = readOnly ? Color.FromArgb(41, 42, 45) : Color.FromArgb(48, 49, 52);
+            t.ForeColor = Color.White;
+            t.Location = new Point(x, y);
+            t.Size = new Size(w, h);
+            Controls.Add(t);
+            return t;
+        }
+
+        Button MakeButton(string text, int x, int y, int w)
+        {
+            Button b = new Button();
+            b.Text = text;
+            b.FlatStyle = FlatStyle.Flat;
+            b.FlatAppearance.BorderColor = Color.FromArgb(95, 99, 104);
+            b.BackColor = Color.FromArgb(48, 49, 52);
+            b.ForeColor = Color.White;
+            b.Font = new Font("Segoe UI", 9.5f);
+            b.Location = new Point(x, y);
+            b.Size = new Size(w, S(32));
+            b.Cursor = Cursors.Hand;
+            Controls.Add(b);
+            return b;
+        }
+
+        async Task DoTranslate()
+        {
+            string text = input.Text.Trim();
+            if (text.Length == 0) { output.Clear(); status.Text = ""; doneFor = ""; return; }
+            if (text == doneFor) return;
+            int id = ++req;
+            status.Text = "Çevriliyor…";
+            try
+            {
+                string[] r = await translate(text);
+                if (id != req) return;
+                output.Text = r[0];
+                status.Text = r[1];
+                outLang = r[2];
+                note.Text = "";
+                doneFor = text;
+            }
+            catch (Exception ex)
+            {
+                if (id == req) status.Text = ex.Message;
+            }
+        }
+
+        void UpdateSpeakButton(Button b)
+        {
+            string st = speechState();
+            string t = st == "playing" ? "⏸ Duraklat" : st == "paused" ? "▶ Devam" : st == "loading" ? "⏳ Ses…" : "🔊 Dinle";
+            if (b.Text != t) b.Text = t;
+        }
+
+        // ✨ Doğal yap: Claude Code'a (abonelik) gönderir; ek ücret yok.
+        async Task DoNaturalize()
+        {
+            string text = input.Text.Trim();
+            if (text.Length == 0) return;
+            debounce.Stop();
+            if (text != doneFor) await DoTranslate();
+            string literal = outLang == "en" ? output.Text : "";
+            int id = ++req;
+            natBtn.Enabled = false;
+            status.Text = "✨ Claude düzenliyor…";
+            try
+            {
+                string[] r = await naturalize(text, literal);
+                if (id != req) return;
+                output.Text = r[0];
+                note.Text = r[1];
+                outLang = "en";
+                doneFor = text;
+                status.Text = "✨ Doğal İngilizce (Claude Haiku)";
+            }
+            catch (Exception ex)
+            {
+                if (id == req) status.Text = ex.Message;
+            }
+            finally { natBtn.Enabled = true; }
+        }
+
+        bool CopyOutput()
+        {
+            if (output.Text.Length == 0) return false;
+            if (!App.SetClipboardText(output.Text)) { status.Text = "Panoya yazılamadı; tekrar deneyin."; return false; }
+            copyBtn.Text = "✓ Kopyalandı";
+            copyReset.Stop();
+            copyReset.Start();
+            return true;
+        }
+
+        async Task CopyAndClose()
+        {
+            debounce.Stop();
+            if (input.Text.Trim() != doneFor) await DoTranslate();
+            if (input.Text.Trim() == doneFor && CopyOutput()) Hide();
+        }
+
+        // Ekranın sağ altında, saatin üstünde açılır.
+        public void ShowNear()
+        {
+            Rectangle wa = Screen.FromPoint(Cursor.Position).WorkingArea;
+            Location = new Point(wa.Right - Width - S(12), wa.Bottom - Height - S(12));
+            Show();
+            Activate();
+            input.Focus();
+            input.SelectAll();
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); return; }
+            base.OnFormClosing(e);
         }
     }
 
@@ -297,6 +668,9 @@ namespace SecCevir
         readonly NotifyIcon tray;
         readonly Popup popup;
         readonly MouseHook mouseHook;
+        readonly WriteForm writer;
+        readonly HotkeyWindow hotkey;
+        uint seqAtDown;
         static readonly HttpClient http = MakeHttp();
         readonly string mp3Path = Path.Combine(Path.GetTempPath(), "seccevir_ses.mp3");
 
@@ -321,10 +695,19 @@ namespace SecCevir
         {
             popup = new Popup();
             IntPtr unused = popup.Handle;
-            popup.SpeakClicked += delegate { Speak(currentText); };
+            popup.SpeakClicked += delegate { Speak(currentText, currentLang); };
+
+            writer = new WriteForm(TranslateForWriter, Naturalize, Speak, SpeechState, PauseSpeech, ResumeSpeech);
+            hotkey = new HotkeyWindow(delegate { writer.ShowNear(); });
+            if (!hotkey.Ok) Log("Ctrl+Alt+T kısayolu kurulamadı (başka bir program kullanıyor olabilir)");
 
             ContextMenuStrip menu = new ContextMenuStrip();
-            ToolStripMenuItem onOff = new ToolStripMenuItem("Açık");
+            ToolStripMenuItem write = new ToolStripMenuItem(hotkey.Ok ? "Yaz-Çevir  (Ctrl+Alt+T)" : "Yaz-Çevir");
+            write.Font = new Font(write.Font, FontStyle.Bold);
+            write.Click += delegate { writer.ShowNear(); };
+            menu.Items.Add(write);
+            menu.Items.Add(new ToolStripSeparator());
+            ToolStripMenuItem onOff = new ToolStripMenuItem("Seçince çevir");
             onOff.Checked = true;
             onOff.Click += delegate
             {
@@ -348,11 +731,16 @@ namespace SecCevir
 
             tray = new NotifyIcon();
             tray.Icon = MakeIcon();
-            tray.Text = "Seç-Çevir (İngilizce → Türkçe)";
+            tray.Text = "Seç-Çevir · tıklayın: Yaz-Çevir";
             tray.ContextMenuStrip = menu;
+            tray.MouseClick += delegate(object s, MouseEventArgs e)
+            {
+                if (e.Button == MouseButtons.Left) writer.ShowNear();
+            };
             tray.Visible = true;
             tray.ShowBalloonTip(3000, "Seç-Çevir çalışıyor",
-                "İngilizce bir metni fareyle seçin; Türkçesi altında görünür.", ToolTipIcon.Info);
+                "İngilizce metni seçin: Türkçesi çıkar. Simgeye tıklayın: Türkçe yazın, İngilizcesini kopyalayın.",
+                ToolTipIcon.Info);
 
             // Kancadan hemen dön; işi arayüzün mesaj kuyruğuna bırak ki fare takılmasın.
             mouseHook = new MouseHook(delegate(int msg, Point pt)
@@ -372,6 +760,7 @@ namespace SecCevir
         protected override void ExitThreadCore()
         {
             mouseHook.Stop();
+            hotkey.Dispose();
             Native.mciSendString("close seccevir", null, 0, IntPtr.Zero);
             tray.Visible = false;
             tray.Dispose();
@@ -429,6 +818,9 @@ namespace SecCevir
                 {
                     popup.Hide();
                     downPt = pt;
+                    // "Seçince kopyalayan" terminaller (Git Bash, PuTTY) panoyu bırakınca
+                    // değiştirir; değişip değişmediğini anlamak için şimdiki sırayı sakla.
+                    seqAtDown = Native.GetClipboardSequenceNumber();
                 }
                 return;
             }
@@ -451,11 +843,9 @@ namespace SecCevir
 
             Point at = new Point(Math.Min(downPt.X, pt.X), Math.Max(downPt.Y, pt.Y) + 22);
             int topY = Math.Min(downPt.Y, pt.Y) - 22;
-            Capture(at, topY);
+            Capture(at, topY, pt);
         }
 
-        // Terminallerde Ctrl+C çalışan komutu keser; Dosya Gezgini ve masaüstünde
-        // dosyayı kopyalar. Bu pencerelerde hiç dokunma.
         static string ForegroundClass()
         {
             StringBuilder sb = new StringBuilder(256);
@@ -463,13 +853,64 @@ namespace SecCevir
             return sb.ToString();
         }
 
-        static bool IsSkippedForeground()
+        // Terminallerde Ctrl+C çalışan komutu keser. Bunlara tuş gönderilmez;
+        // seçim UI Automation ya da "seçince kopyala" panosuyla okunur.
+        static bool IsTerminal(string cls)
         {
-            string cls = ForegroundClass();
             return cls == "ConsoleWindowClass" || cls == "CASCADIA_HOSTING_WINDOW_CLASS"
-                || cls == "mintty" || cls == "PuTTY"
-                || cls == "CabinetWClass" || cls == "ExploreWClass"
+                || cls == "mintty" || cls == "PuTTY" || cls == "VirtualConsoleClass";
+        }
+
+        // Dosya Gezgini ve masaüstünde Ctrl+C dosyayı kopyalar: hiç dokunma.
+        static bool IsSkipped(string cls)
+        {
+            return cls == "CabinetWClass" || cls == "ExploreWClass"
                 || cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd";
+        }
+
+        // Yaz-Çevir penceresinde yapılan seçimler çevrilmez.
+        static bool IsOwnForeground()
+        {
+            uint pid;
+            Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out pid);
+            return pid == (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+        }
+
+        public static bool SetClipboardText(string text)
+        {
+            for (int i = 0; i < 5; i++)
+            {
+                try { Clipboard.SetText(text); return true; }
+                catch { System.Threading.Thread.Sleep(40); }
+            }
+            return false;
+        }
+
+        // Terminaldeki seçimi okur. Önce pano: terminal seçimi kendisi kopyaladıysa
+        // (Git Bash, PuTTY, Windows Terminal'de "copyOnSelect") oradan alınır.
+        // Değilse UI Automation ile doğrudan okunur. Pano eski haline döndürülmez,
+        // çünkü kopyalamayı terminal kendisi yaptı.
+        async Task<string> ReadTerminalSelection(Point pt)
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                if (Native.GetClipboardSequenceNumber() != seqAtDown)
+                {
+                    for (int j = 0; j < 6; j++)
+                    {
+                        try { if (Clipboard.ContainsText()) { Debug("terminal: panodan"); return Clipboard.GetText(); } }
+                        catch { }
+                        await Task.Delay(40);
+                    }
+                    break;
+                }
+                await Task.Delay(30);
+            }
+
+            Task<string> t = Task.Run(delegate { return UiaReader.ReadSelection(pt, MaxChars * 2); });
+            if (await Task.WhenAny(t, Task.Delay(2000)) != t) { Log("atlandı: terminal seçimi zamanında okunamadı"); return null; }
+            if (!string.IsNullOrEmpty(t.Result)) Debug("terminal: UI Automation");
+            return t.Result;
         }
 
         static bool KeyDown(int vk) { return (Native.GetAsyncKeyState(vk) & 0x8000) != 0; }
@@ -488,7 +929,7 @@ namespace SecCevir
             return false;
         }
 
-        async void Capture(Point at, int topY)
+        async void Capture(Point at, int topY, Point upPt)
         {
             if (busy) { Log("atlandı: önceki seçim hâlâ kopyalanıyor"); return; }
             busy = true;
@@ -496,17 +937,27 @@ namespace SecCevir
             try
             {
                 await Task.Delay(150);
-                if (IsSkippedForeground()) { Debug("atlandı: pencere " + ForegroundClass()); return; }
-                if (!await WaitModifiersReleased()) { Log("atlandı: Shift/Ctrl/Alt tuşu bırakılmadı"); return; }
-
-                text = await CopySelection();
-                if (text == null)
+                string cls = ForegroundClass();
+                if (IsSkipped(cls)) { Debug("atlandı: pencere " + cls); return; }
+                if (IsOwnForeground()) return;
+                if (IsTerminal(cls))
                 {
-                    // Bazı uygulamalar seçimi geç tamamlar; bir kez daha dene.
-                    await Task.Delay(200);
-                    text = await CopySelection();
+                    text = await ReadTerminalSelection(upPt);
+                    if (string.IsNullOrEmpty(text)) { Log("atlandı: terminalde seçim okunamadı (" + cls + ")"); return; }
                 }
-                if (text == null) { Log("atlandı: uygulama Ctrl+C'ye metin vermedi (" + ForegroundClass() + ")"); return; }
+                else
+                {
+                    if (!await WaitModifiersReleased()) { Log("atlandı: Shift/Ctrl/Alt tuşu bırakılmadı"); return; }
+
+                    text = await CopySelection();
+                    if (text == null)
+                    {
+                        // Bazı uygulamalar seçimi geç tamamlar; bir kez daha dene.
+                        await Task.Delay(200);
+                        text = await CopySelection();
+                    }
+                    if (text == null) { Log("atlandı: uygulama Ctrl+C'ye metin vermedi (" + ForegroundClass() + ")"); return; }
+                }
             }
             catch (Exception ex) { Log("hata (kopyalama): " + ex.Message); return; }
             finally { busy = false; }
@@ -526,7 +977,7 @@ namespace SecCevir
             int id = ++requestId;
 
             string[] hit;
-            if (cache.TryGetValue(text, out hit))
+            if (cache.TryGetValue("tr|" + text, out hit))
             {
                 currentLang = hit[1];
                 popup.ShowAt(at, topY, shown, hit[0]);
@@ -545,7 +996,7 @@ namespace SecCevir
             string tr;
             try
             {
-                string[] res = await Translate(text);
+                string[] res = await Translate(text, "tr");
                 Debug("çevrildi: dil=" + res[1] + " görünür=" + popup.Visible + " güncel=" + (id == requestId));
                 if (res[1] == "tr")
                 {
@@ -554,7 +1005,7 @@ namespace SecCevir
                     return;
                 }
                 if (cache.Count > 300) cache.Clear();
-                cache[text] = res;
+                cache["tr|" + text] = res;
                 if (id == requestId) currentLang = res[1];
                 tr = cut ? res[0] + " …(ilk " + MaxChars + " karakter çevrildi)" : res[0];
             }
@@ -672,19 +1123,184 @@ namespace SecCevir
             }
         }
 
-        // Dönüş: [Türkçe çeviri, Google'ın tanıdığı kaynak dil (ör. "en")]
-        // Ana adres "çok fazla istek" (429) ya da başka bir hata verirse ikinci adres denenir.
-        static async Task<string[]> Translate(string text)
+        // Yaz-Çevir penceresi için: Türkçe yazıldıysa İngilizceye, İngilizce yazıldıysa
+        // Türkçeye çevirir. Dönüş: [çeviri, yön yazısı, hedef dil]. Hata mesajı kullanıcıya gösterilir.
+        async Task<string[]> TranslateForWriter(string text)
         {
-            try { return await TranslateMain(text); }
-            catch (TaskCanceledException) { throw; }
-            catch (Exception ex) { Log("ana çeviri adresi: " + ex.Message + "; yedek adres deneniyor"); }
-            return await TranslateBackup(text);
+            if (text.Length > MaxChars * 4) throw new Exception("Metin çok uzun; en fazla " + (MaxChars * 4) + " karakter.");
+            if (DateTime.UtcNow < pauseUntil)
+            {
+                int sec = (int)Math.Ceiling((pauseUntil - DateTime.UtcNow).TotalSeconds);
+                throw new Exception("Google kısa bir mola istedi; " + sec + " saniye sonra tekrar deneyin.");
+            }
+            try
+            {
+                string[] r = await CachedTranslate(text, "en");
+                if (r[1] != "en") return new string[] { r[0], "Türkçe → İngilizce", "en" };
+                string[] back = await CachedTranslate(text, "tr");
+                return new string[] { back[0], "İngilizce → Türkçe", "tr" };
+            }
+            catch (Exception ex)
+            {
+                Log("hata (Yaz-Çevir): " + ex.Message);
+                HttpStatusException he = ex as HttpStatusException;
+                if (he != null && he.Code == 429)
+                {
+                    pauseUntil = DateTime.UtcNow.AddSeconds(60);
+                    throw new Exception("Google kısa bir mola istedi; 1 dakika sonra tekrar deneyin.");
+                }
+                if (ex is TaskCanceledException) throw new Exception("Çeviri gecikti (internet yavaş olabilir); tekrar deneyin.");
+                throw new Exception("Çeviri alınamadı (internet bağlantısını kontrol edin).");
+            }
         }
 
-        static async Task<string[]> TranslateBackup(string text)
+        // ---- Claude ile doğal İngilizce (Claude Code aboneliği üzerinden, ek ücret yok) ----
+        // Bilgisayardaki Claude Code (claude.exe) "-p" ile çağrılır; istek kullanıcının abonelik
+        // girişiyle gider. API anahtarı alt sürece hiç geçirilmez: anahtar sonradan eklense bile
+        // ücretli API'ye düşülmez.
+        const string NaturalPrompt =
+            "You help a Turkish speaker write natural, everyday English. " +
+            "The user message is text they wrote, in Turkish or in their own English; a machine translation may be attached, often too literal. " +
+            "If the text is Turkish: write how a native English speaker would naturally say it, keeping the meaning and tone. " +
+            "If the text is English: correct it and make it natural, changing as little as needed. " +
+            "Keep the exact meaning: do not add, drop or soften ideas, and keep every action as described " +
+            "(if they press a button, they press it; they do not say it). " +
+            "Avoid redundant words (for example, 'dictating' already means by voice). " +
+            "When the text is speech-to-text, read past dictation slips and keep what they clearly meant. " +
+            "Reply with ONLY a JSON object, no code fences: " +
+            "{\"natural\": \"<final English text>\", \"note\": \"<one or two short sentences in simple Turkish: the most important change and why; if nothing needed changing, say so>\"}";
+
+        static string FindClaude()
         {
-            string json = await Get("https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=tr&q="
+            string p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), @".local\bin\claude.exe");
+            if (File.Exists(p)) return p;
+            foreach (string dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';'))
+            {
+                try
+                {
+                    string c = Path.Combine(dir.Trim(), "claude.exe");
+                    if (File.Exists(c)) return c;
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        // Claude Code'un çalıştığı boş klasör (proje kurallarını yüklemesin) ve sistem metni dosyası.
+        static string PrepareWorkDir()
+        {
+            string dir = Path.Combine(Path.GetTempPath(), "seccevir-claude");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "sistem.txt"), NaturalPrompt, new UTF8Encoding(false));
+            return dir;
+        }
+
+        async Task<string[]> Naturalize(string text, string literal)
+        {
+            if (text.Length > 2000) throw new Exception("Doğal yap için metin çok uzun (en fazla 2000 karakter).");
+            string exe = FindClaude();
+            if (exe == null) throw new Exception("Claude Code bulunamadı (claude.exe).");
+
+            string user = "Text the user wrote:\n" + text;
+            if (literal.Length > 0 && literal != text) user += "\n\nMachine translation (may be too literal):\n" + literal;
+
+            string[] res = await Task.Run(delegate { return RunClaude(exe, user); });
+            return res;
+        }
+
+        static string[] RunClaude(string exe, string user)
+        {
+            string dir = PrepareWorkDir();
+            System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo(exe,
+                "-p --model haiku --tools \"\" --strict-mcp-config --no-session-persistence --output-format json " +
+                "--system-prompt-file \"" + Path.Combine(dir, "sistem.txt") + "\"");
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.WorkingDirectory = dir;
+            psi.RedirectStandardInput = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.StandardOutputEncoding = Encoding.UTF8;
+            psi.StandardErrorEncoding = Encoding.UTF8;
+            // Ücretli API'ye asla düşmesin: anahtarlar alt sürece verilmez, abonelik girişi kullanılır.
+            psi.EnvironmentVariables.Remove("ANTHROPIC_API_KEY");
+            psi.EnvironmentVariables.Remove("ANTHROPIC_AUTH_TOKEN");
+
+            string stdout;
+            int exit;
+            using (System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi))
+            {
+                byte[] input = new UTF8Encoding(false).GetBytes(user);
+                proc.StandardInput.BaseStream.Write(input, 0, input.Length);
+                proc.StandardInput.Close();
+                Task<string> outTask = proc.StandardOutput.ReadToEndAsync();
+                Task<string> errTask = proc.StandardError.ReadToEndAsync();
+                if (!proc.WaitForExit(90000))
+                {
+                    try { proc.Kill(); } catch { }
+                    throw new Exception("Claude gecikti; tekrar deneyin.");
+                }
+                stdout = outTask.Result;
+                exit = proc.ExitCode;
+            }
+
+            JavaScriptSerializer js = new JavaScriptSerializer();
+            Dictionary<string, object> root = null;
+            try { root = js.DeserializeObject(stdout.Trim()) as Dictionary<string, object>; } catch { }
+            if (root == null)
+            {
+                Log("Claude Code: çıktı okunamadı (çıkış kodu " + exit + ")");
+                throw new Exception("Claude Code yanıt vermedi. Bir terminalde \"claude\" yazıp giriş yapılı olduğunu kontrol edin.");
+            }
+            object v;
+            string result = root.TryGetValue("result", out v) ? (v as string ?? "") : "";
+            bool isError = root.TryGetValue("is_error", out v) && v is bool && (bool)v;
+            if (isError || exit != 0)
+            {
+                Log("Claude Code hata (çıkış kodu " + exit + ")");
+                string m = result.Length > 160 ? result.Substring(0, 160) + "…" : result;
+                throw new Exception("Claude Code: " + (m.Length > 0 ? m : "istek tamamlanamadı (abonelik limiti dolmuş olabilir)."));
+            }
+
+            // Model bazen JSON'u ``` içine alır: ilk { ile son } arasını al.
+            int a = result.IndexOf('{'), b = result.LastIndexOf('}');
+            if (a >= 0 && b > a)
+            {
+                try
+                {
+                    Dictionary<string, object> o = js.DeserializeObject(result.Substring(a, b - a + 1)) as Dictionary<string, object>;
+                    if (o != null && o.ContainsKey("natural"))
+                        return new string[] { (o["natural"] as string) ?? "", o.ContainsKey("note") ? (o["note"] as string) ?? "" : "" };
+                }
+                catch { }
+            }
+            Log("Claude Code: JSON okunamadı");
+            throw new Exception("Claude'un yanıtı okunamadı; tekrar deneyin.");
+        }
+
+        async Task<string[]> CachedTranslate(string text, string tl)
+        {
+            string[] hit;
+            if (cache.TryGetValue(tl + "|" + text, out hit)) return hit;
+            string[] res = await Translate(text, tl);
+            if (cache.Count > 300) cache.Clear();
+            cache[tl + "|" + text] = res;
+            return res;
+        }
+
+        // Dönüş: [çeviri, Google'ın tanıdığı kaynak dil (ör. "en")]. tl: hedef dil ("tr" ya da "en").
+        // Ana adres "çok fazla istek" (429) ya da başka bir hata verirse ikinci adres denenir.
+        static async Task<string[]> Translate(string text, string tl)
+        {
+            try { return await TranslateMain(text, tl); }
+            catch (TaskCanceledException) { throw; }
+            catch (Exception ex) { Log("ana çeviri adresi: " + ex.Message + "; yedek adres deneniyor"); }
+            return await TranslateBackup(text, tl);
+        }
+
+        static async Task<string[]> TranslateBackup(string text, string tl)
+        {
+            string json = await Get("https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=" + tl + "&q="
                                     + Uri.EscapeDataString(text));
             // Biçim: [["çeviri","en"]] ya da ["çeviri"]
             object[] root = (object[])new JavaScriptSerializer().DeserializeObject(json);
@@ -694,9 +1310,9 @@ namespace SecCevir
             return new string[] { (string)root[0], "en" };
         }
 
-        static async Task<string[]> TranslateMain(string text)
+        static async Task<string[]> TranslateMain(string text, string tl)
         {
-            string json = await Get("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=tr&dt=t&q="
+            string json = await Get("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=" + tl + "&dt=t&q="
                                     + Uri.EscapeDataString(text));
             object[] root = (object[])new JavaScriptSerializer().DeserializeObject(json);
             StringBuilder sb = new StringBuilder();
@@ -709,14 +1325,64 @@ namespace SecCevir
             return new string[] { sb.ToString(), lang };
         }
 
-        async void Speak(string text)
+        // ---- Ses: dinle, duraklat, devam et ----
+        // Ses ya Google'dan gelen mp3 (MCI ile çalınır) ya da Windows'un kendi sesidir (synth).
+        bool speechLoading;
+        bool usingSynth;
+
+        // "loading", "playing", "paused" ya da "stopped".
+        public string SpeechState()
+        {
+            if (speechLoading) return "loading";
+            if (usingSynth)
+            {
+                if (synth == null) return "stopped";
+                if (synth.State == System.Speech.Synthesis.SynthesizerState.Speaking) return "playing";
+                if (synth.State == System.Speech.Synthesis.SynthesizerState.Paused) return "paused";
+                return "stopped";
+            }
+            StringBuilder sb = new StringBuilder(32);
+            if (Native.mciSendString("status seccevir mode", sb, sb.Capacity, IntPtr.Zero) != 0) return "stopped";
+            string m = sb.ToString();
+            return m == "playing" || m == "paused" ? m : "stopped";
+        }
+
+        public void PauseSpeech()
+        {
+            if (usingSynth) { if (synth != null) try { synth.Pause(); } catch { } }
+            else Native.mciSendString("pause seccevir", null, 0, IntPtr.Zero);
+        }
+
+        public void ResumeSpeech()
+        {
+            if (usingSynth) { if (synth != null) try { synth.Resume(); } catch { } }
+            else Native.mciSendString("resume seccevir", null, 0, IntPtr.Zero);
+        }
+
+        void StopSpeech()
+        {
+            Native.mciSendString("close seccevir", null, 0, IntPtr.Zero);
+            if (synth != null)
+            {
+                try
+                {
+                    if (synth.State == System.Speech.Synthesis.SynthesizerState.Paused) synth.Resume();
+                    synth.SpeakAsyncCancelAll();
+                }
+                catch { }
+            }
+        }
+
+        async void Speak(string text, string lang)
         {
             if (string.IsNullOrEmpty(text)) return;
             if (text.Length > 200) text = text.Substring(0, 200);
+            StopSpeech();
+            usingSynth = false;
+            speechLoading = true;
             try
             {
-                Native.mciSendString("close seccevir", null, 0, IntPtr.Zero);
-                string url = "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=" + Uri.EscapeDataString(currentLang) + "&q="
+                string url = "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=" + Uri.EscapeDataString(lang) + "&q="
                              + Uri.EscapeDataString(text);
                 using (HttpResponseMessage r = await http.GetAsync(url))
                 {
@@ -726,9 +1392,12 @@ namespace SecCevir
                 if (Native.mciSendString("open \"" + mp3Path + "\" type mpegvideo alias seccevir", null, 0, IntPtr.Zero) != 0)
                     throw new IOException("mci");
                 Native.mciSendString("play seccevir", null, 0, IntPtr.Zero);
+                speechLoading = false;
             }
             catch
             {
+                speechLoading = false;
+                usingSynth = true;
                 // İnternetten ses alınamazsa Windows'un kendi İngilizce sesine düş.
                 try
                 {

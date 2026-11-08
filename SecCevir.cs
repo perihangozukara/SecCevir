@@ -1373,21 +1373,58 @@ namespace SecCevir
             }
         }
 
+        // Google'ın ses servisi tek istekte en fazla ~200 karakter alır. Uzun metin cümle,
+        // virgül ya da kelime sınırından parçalanır; parçaların sesi tek mp3'te birleştirilir.
+        const int TtsChunk = 190, TtsMaxChars = 3000;
+
+        static List<string> SplitForTts(string text)
+        {
+            List<string> parts = new List<string>();
+            string rest = Regex.Replace(text, @"\s+", " ").Trim();
+            while (rest.Length > TtsChunk)
+            {
+                int cut = -1;
+                foreach (char c in new[] { '.', '!', '?', ';', ':', ',' })
+                {
+                    int i = rest.LastIndexOf(c, TtsChunk - 1);
+                    if (i > TtsChunk / 3 && i > cut) { cut = i; break; }
+                }
+                if (cut < 0) cut = rest.LastIndexOf(' ', TtsChunk - 1);
+                if (cut <= 0) cut = TtsChunk - 1;
+                parts.Add(rest.Substring(0, cut + 1).Trim());
+                rest = rest.Substring(cut + 1).Trim();
+            }
+            if (rest.Length > 0) parts.Add(rest);
+            return parts;
+        }
+
+        int speakId;
+
         async void Speak(string text, string lang)
         {
             if (string.IsNullOrEmpty(text)) return;
-            if (text.Length > 200) text = text.Substring(0, 200);
+            if (text.Length > TtsMaxChars) text = text.Substring(0, TtsMaxChars);
+            int id = ++speakId;
             StopSpeech();
             usingSynth = false;
             speechLoading = true;
             try
             {
-                string url = "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=" + Uri.EscapeDataString(lang) + "&q="
-                             + Uri.EscapeDataString(text);
-                using (HttpResponseMessage r = await http.GetAsync(url))
+                using (MemoryStream all = new MemoryStream())
                 {
-                    if (!r.IsSuccessStatusCode) throw new HttpStatusException((int)r.StatusCode);
-                    File.WriteAllBytes(mp3Path, await r.Content.ReadAsByteArrayAsync());
+                    foreach (string part in SplitForTts(text))
+                    {
+                        string url = "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=" + Uri.EscapeDataString(lang)
+                                     + "&total=1&idx=0&textlen=" + part.Length + "&q=" + Uri.EscapeDataString(part);
+                        using (HttpResponseMessage r = await http.GetAsync(url))
+                        {
+                            if (!r.IsSuccessStatusCode) throw new HttpStatusException((int)r.StatusCode);
+                            byte[] b = await r.Content.ReadAsByteArrayAsync();
+                            all.Write(b, 0, b.Length);
+                        }
+                        if (id != speakId) return; // bu arada yeni bir Dinle'ye basıldı
+                    }
+                    File.WriteAllBytes(mp3Path, all.ToArray());
                 }
                 if (Native.mciSendString("open \"" + mp3Path + "\" type mpegvideo alias seccevir", null, 0, IntPtr.Zero) != 0)
                     throw new IOException("mci");
@@ -1396,6 +1433,7 @@ namespace SecCevir
             }
             catch
             {
+                if (id != speakId) return;
                 speechLoading = false;
                 usingSynth = true;
                 // İnternetten ses alınamazsa Windows'un kendi İngilizce sesine düş.

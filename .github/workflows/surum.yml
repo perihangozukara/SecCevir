@@ -1,0 +1,51 @@
+# Kod main'e her gittiğinde exe'yi derler ve yeni sürüm yayınlar (v1.0.<sayı>).
+# Elle çalıştırınca "yayinla" kapalıysa yalnızca derler (deneme).
+name: Sürüm
+
+on:
+  push:
+    branches: [main]
+    paths: [SecCevir.cs, derle.bat]
+  workflow_dispatch:
+    inputs:
+      yayinla:
+        description: "Sürüm yayınlansın mı?"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  derle:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derle
+        shell: cmd
+        run: call derle.bat
+
+      - name: Exe var mı
+        shell: pwsh
+        run: |
+          if (-not (Test-Path SecCevir.exe)) { throw "SecCevir.exe oluşmadı" }
+          (Get-Item SecCevir.exe).Length
+
+      - name: Deneme çıktısı
+        if: github.event_name == 'workflow_dispatch' && !inputs.yayinla
+        uses: actions/upload-artifact@v4
+        with:
+          name: SecCevir-deneme
+          path: SecCevir.exe
+
+      - name: Sürüm yayınla
+        if: github.event_name == 'push' || inputs.yayinla
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v1.0.${{ github.run_number }}"
+          $msg = git log -1 --format=%s
+          $notes = "Otomatik sürüm. Son değişiklik: $msg`n`nDownload SecCevir.exe below and run it. Windows SmartScreen may warn on first run: More info -> Run anyway."
+          gh release create $tag SecCevir.exe --target $env:GITHUB_SHA --title "Seç-Çevir $tag" --notes $notes

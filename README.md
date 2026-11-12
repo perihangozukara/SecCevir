@@ -1,4 +1,57 @@
-﻿# Seç-Çevir (Select & Translate)
+# Seç-Çevir
+
+🇹🇷 Türkçe · [English below](#english)
+
+İngilizce bilmeyenler için küçük bir Windows aracı. Bilgisayarda hangi programda olursan ol, İngilizce bir yazıyı fareyle seç; Türkçesi hemen altında görünür. Türkçe yazılara dokunmaz.
+
+<p>
+  <img src="docs/kapak.png" alt="Seç-Çevir: İngilizce yazıyı seç, Türkçesini gör" width="49%">
+  <img src="docs/yaz-cevir.png" alt="Yaz-Çevir penceresi" width="49%">
+</p>
+
+## İndir
+
+**[⬇ SecCevir.exe dosyasını indir](https://github.com/perihangozukara/SecCevir/releases/latest/download/SecCevir.exe)**
+
+İndirdiğin dosyaya çift tıkla, çalışır. Kurulum yoktur. Windows 10 ya da 11 gerekir.
+
+### İlk açılışta Windows uyarı verirse
+
+Program küçük ve yeni olduğu için Windows ilk açılışta mavi bir uyarı penceresi gösterebilir. Bu, programın zararlı olduğu anlamına gelmez; yalnızca imzalı olmadığını söyler.
+
+1. **Ek bilgi** yazısına tıkla.
+2. Altta çıkan **Yine de çalıştır** düğmesine bas.
+
+(Windows'un İngilizceyse: **More info → Run anyway**.)
+
+## Nasıl kullanılır
+
+1. Program açılınca ekranın sağ altında, saatin yanındaki küçük simgelerin arasına yerleşir.
+2. Herhangi bir programda İngilizce bir yazıyı fareyle seç.
+3. Türkçesi seçtiğin yerin hemen altında çıkar.
+
+## Neler yapar
+
+- **Her yerde çalışır.** Yalnızca internet tarayıcısında değil; programlarda, pencerelerde ve terminalde de çalışır. Terminalde çalışan komutu kesmez.
+- **Yaz-Çevir.** Saatin yanındaki simgeye tıkla ya da `Ctrl+Alt+T` tuşlarına bas. Türkçe bir cümle yaz, İngilizcesi çıkar. İngilizce yazarsan Türkçesi çıkar. `Ctrl+Enter` kopyalar ve pencereyi kapatır, `Esc` kapatır.
+- **✨ Doğal İngilizce.** Yaz-Çevir penceresinde, yazdığın cümleyi Claude'a daha doğal bir İngilizceye çevirtir ve neyi değiştirdiğini kısa bir Türkçe notla söyler. Bunun için bilgisayarında [Claude Code](https://claude.com/claude-code) kurulu ve giriş yapılmış olmalıdır. Diğer her şey onsuz çalışır.
+- **Kopyala.** Çeviri kutusundaki 📋 düğmesi Türkçe çeviriyi kopyalar.
+- **Sesli okur.** 🔊 düğmesi yazıyı sesli okur.
+- **Aç / kapat.** Simgeye sağ tıkla: "Seçince çevir" ile açıp kapatabilir, "Windows ile başlat" ile bilgisayar açılınca kendiliğinden başlamasını sağlayabilirsin.
+
+## Gizlilik
+
+Seçtiğin yazı, çevrilmek üzere Google Çeviri'ye gönderilir. Gizli yazılarda kullanma.
+
+## Sorun olursa
+
+Program, bir yazıyı neden çevirmediğini exe dosyasının yanındaki `SecCevir.log` dosyasına yazar. Seçtiğin yazının kendisini asla yazmaz.
+
+---
+
+<a name="english"></a>
+
+# Seç-Çevir (Select & Translate) · English
 
 A small Windows tool for people reading English: select English (or other foreign-language) text with the mouse in any app, and its Turkish translation appears right under the selection. Turkish text is ignored.
 

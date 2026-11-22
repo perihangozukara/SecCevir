@@ -852,6 +852,18 @@ namespace SecCevir
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(exit);
 
+            // Aç/kapat seçeneklerine tıklayınca menü açık kalsın; tik değişir, menüyü yeniden açmak gerekmez.
+            bool keepOpen = false;
+            menu.ItemClicked += delegate(object s, ToolStripItemClickedEventArgs e)
+            {
+                keepOpen = e.ClickedItem == onOff || e.ClickedItem == autoStart;
+            };
+            menu.Closing += delegate(object s, ToolStripDropDownClosingEventArgs e)
+            {
+                if (keepOpen && e.CloseReason == ToolStripDropDownCloseReason.ItemClicked) e.Cancel = true;
+                keepOpen = false;
+            };
+
             tray = new NotifyIcon();
             tray.Icon = MakeIcon();
             tray.Text = "Seç-Çevir · tıklayın: Yaz-Çevir";

@@ -37,3 +37,7 @@ Geliştirirken çıkan hatalar, nedenleri ve sonrasında konan kurallar.
 - Neden: Seçilen alan `Bitmap.Clone` ile kesilince büyük görüntüyle bellek paylaşıyordu; aynı OCR motoruna aynı anda iki okuma gidince biri iptal ediliyordu.
 - Kural: Arka plana verilen resim bağımsız bir kopyadır. OCR okumaları sıraya konur; iptalde bir kez yeniden denenir.
 - Not: İngilizce OCR parçası yoksa Türkçe okuyucu kullanılır ve küçük yazıda hata artar. Kurulum: `Add-WindowsCapability -Online -Name "Language.OCR~~~en-US~0.0.1.0"` (yönetici PowerShell).
+
+## Uzun seçimde "ilk 1000 karakter çevrildi" uyarısı görünmüyordu
+- Neden: Uyarı çevirinin sonundaydı; uzun çeviride kutu ekrana sığmayınca görünmüyordu. Önbellekten gelen çeviride hiç yoktu. Metin kelimenin ortasından kesiliyordu.
+- Kural: Uyarı kutunun üstünde ayrı satırda gösterilir (önbellekte de). Metin cümle, yoksa kelime sonunda kesilir.

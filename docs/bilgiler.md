@@ -41,6 +41,12 @@
 - Sonra Seç-Çevir'i kapatıp aç.
 - Çok küçük yazıda daha büyük bir alan çiz ya da sayfayı yakınlaştır.
 
+## Uzun yazı seçersen
+- Program bir seferde en fazla 1000 karakter çevirir.
+- Daha uzun seçersen ilk 1000 karakteri çevirir.
+- Kutunun üstünde altın renkli bir uyarı çıkar.
+- Yazı cümle sonunda kesilir, kelime yarım kalmaz.
+
 ## Gizlilik
 - Seçtiğin yazı çeviri için Google Çeviri'ye gider. Gizli yazılarda kullanma.
 - Ekrandan okumada ekran görüntüsü diske kaydedilmez.

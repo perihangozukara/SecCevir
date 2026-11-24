@@ -690,7 +690,7 @@ namespace SecCevir
 
     class Popup : Form
     {
-        readonly Label head, spk, cpy, en, tr;
+        readonly Label head, spk, cpy, note, en, tr;
         bool dwmBorder;
         readonly Timer cpyReset = new Timer();
         readonly float scale;
@@ -739,6 +739,13 @@ namespace SecCevir
             cpyReset.Interval = 1200;
             cpyReset.Tick += delegate { cpyReset.Stop(); cpy.Text = "📋"; };
 
+            // Uzun seçimde "yalnızca ilk N karakter çevrildi" uyarısı. Kutunun üstünde durur;
+            // sonda dursaydı uzun çeviride ekranın dışında kalıyordu.
+            note = new Label();
+            note.Font = new Font("Segoe UI Semibold", 9f);
+            note.ForeColor = Theme.Gold;
+            note.Visible = false;
+
             en = new Label();
             en.Font = new Font("Segoe UI", 9.5f);
             en.ForeColor = Theme.Muted;
@@ -750,6 +757,7 @@ namespace SecCevir
             Controls.Add(head);
             Controls.Add(spk);
             Controls.Add(cpy);
+            Controls.Add(note);
             Controls.Add(en);
             Controls.Add(tr);
         }
@@ -787,10 +795,12 @@ namespace SecCevir
         }
 
         // at: seçimin altı; topY: seçimin üstü (altta yer yoksa popup oraya çıkar).
-        public void ShowAt(Point at, int topY, string enText, string trText)
+        public void ShowAt(Point at, int topY, string enText, string trText, string noteText = null)
         {
             anchor = at;
             aboveY = topY;
+            note.Text = noteText ?? "";
+            note.Visible = note.Text.Length > 0;
             en.Text = enText;
             tr.Text = trText;
             Relayout();
@@ -817,11 +827,20 @@ namespace SecCevir
             int p = S(12);
             en.UseMnemonic = false;
             tr.UseMnemonic = false;
+            note.UseMnemonic = false;
             head.Location = new Point(p + S(8), p);
             en.Size = Measure(en, S(440));
             tr.Size = Measure(tr, S(450));
             int contentW = Math.Max(Math.Max(en.Width, tr.Width), head.Width + S(8) + 2 * S(30) + S(20));
-            en.Location = new Point(p - S(3), head.Bottom + S(6));
+            int top = head.Bottom + S(6);
+            if (note.Visible)
+            {
+                note.Size = Measure(note, S(440));
+                contentW = Math.Max(contentW, note.Width);
+                note.Location = new Point(p - S(3), top);
+                top = note.Bottom + S(4);
+            }
+            en.Location = new Point(p - S(3), top);
             tr.Location = new Point(p - S(3), en.Bottom + S(2));
             int right = p - S(3) + contentW;
             cpy.Location = new Point(right - cpy.Width + S(6), p - S(7));
@@ -1607,6 +1626,23 @@ namespace SecCevir
             return sb.ToString();
         }
 
+        // Metni en fazla max karakterde keser; mümkünse cümle, yoksa kelime sonunda.
+        // Kelimenin ortasından kesmek son cümlenin çevirisini bozuyordu.
+        static string CutAtBoundary(string text, int max)
+        {
+            if (text.Length <= max) return text;
+            int min = max * 7 / 10;
+            for (int i = max - 1; i >= min; i--)
+            {
+                char c = text[i];
+                if ((c == '.' || c == '!' || c == '?' || c == '\n') && (i + 1 >= text.Length || char.IsWhiteSpace(text[i + 1])))
+                    return text.Substring(0, i + 1);
+            }
+            for (int i = max; i >= min; i--)
+                if (char.IsWhiteSpace(text[i])) return text.Substring(0, i).TrimEnd();
+            return text.Substring(0, max);
+        }
+
         // Okunan metni kutuda gösterip Türkçeye çevirir. Fareyle seçimde sorunlu metin sessizce
         // atlanır; ekrandan okumada (ocr) kullanıcı bilerek istediği için kutuda nedeni yazılır.
         async void ShowTranslation(string text, Point at, int topY, bool ocr)
@@ -1626,7 +1662,14 @@ namespace SecCevir
             }
 
             bool cut = text.Length > MaxChars;
-            if (cut) text = text.Substring(0, MaxChars);
+            string cutNote = null;
+            if (cut)
+            {
+                int fullLen = text.Length;
+                text = CutAtBoundary(text, MaxChars);
+                Log("kısaltıldı: " + fullLen + " karakterin ilk " + text.Length + " karakteri çevrildi");
+                cutNote = "⚠ Seçim " + MaxChars + " karakterden uzun; yalnızca ilk " + text.Length + " karakter çevrildi.";
+            }
             // Ekrandan okumada OCR hatası fark edilsin diye okunan metnin daha çoğu gösterilir.
             int showMax = ocr ? 600 : 300;
             string shown = text.Length > showMax ? text.Substring(0, showMax) + "…" : text;
@@ -1639,18 +1682,18 @@ namespace SecCevir
             if (cache.TryGetValue("tr|" + text, out hit))
             {
                 currentLang = hit[1];
-                popup.ShowAt(at, topY, shown, hit[0]);
+                popup.ShowAt(at, topY, shown, hit[0], cutNote);
                 return;
             }
 
             if (DateTime.UtcNow < pauseUntil)
             {
                 int sec = (int)Math.Ceiling((pauseUntil - DateTime.UtcNow).TotalSeconds);
-                popup.ShowAt(at, topY, shown, "Google kısa bir mola istedi; " + sec + " saniye sonra tekrar deneyin.");
+                popup.ShowAt(at, topY, shown, "Google kısa bir mola istedi; " + sec + " saniye sonra tekrar deneyin.", cutNote);
                 return;
             }
 
-            popup.ShowAt(at, topY, shown, "…");
+            popup.ShowAt(at, topY, shown, "…", cutNote);
 
             string tr;
             try
@@ -1681,7 +1724,7 @@ namespace SecCevir
                 if (cache.Count > 300) cache.Clear();
                 cache["tr|" + text] = res;
                 if (id == requestId) currentLang = res[1];
-                tr = cut ? res[0] + " …(ilk " + MaxChars + " karakter çevrildi)" : res[0];
+                tr = res[0];
             }
             catch (Exception ex)
             {

@@ -369,7 +369,12 @@ namespace SecCevir
             sel = Norm(start, e.Location);
             if (sel.Width >= 8 && sel.Height >= 8)
             {
-                Result = shot.Clone(sel, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                // Clone kullanılmaz: GDI+ kesiti büyük görüntüyle paylaşabiliyor; OCR arka planda
+                // okurken büyük görüntü kapatılınca "Object is currently in use elsewhere" hatası
+                // çıkıyordu. Kesit bağımsız yeni bir resme çizilir.
+                Result = new Bitmap(sel.Width, sel.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                using (Graphics g = Graphics.FromImage(Result))
+                    g.DrawImage(shot, new Rectangle(0, 0, sel.Width, sel.Height), sel, GraphicsUnit.Pixel);
                 Selection = new Rectangle(sel.X + Left, sel.Y + Top, sel.Width, sel.Height);
             }
             Close();
@@ -429,6 +434,9 @@ namespace SecCevir
     {
         static Windows.Media.Ocr.OcrEngine engine;
         public static string LanguageTag = "";
+        static readonly System.Threading.SemaphoreSlim gate = new System.Threading.SemaphoreSlim(1, 1);
+
+        class OcrAbortedException : Exception { public OcrAbortedException(string m) : base(m) { } }
 
         // Önce İngilizce okuyucu; yoksa Windows'ta yüklü ilk dil (Latin harfli İngilizceyi de okur).
         static Windows.Media.Ocr.OcrEngine Engine()
@@ -486,7 +494,12 @@ namespace SecCevir
                 try
                 {
                     if (st == Windows.Foundation.AsyncStatus.Completed) tcs.TrySetResult(o.GetResults());
-                    else if (st == Windows.Foundation.AsyncStatus.Error) tcs.TrySetException(new Exception("OCR hatası: 0x" + o.ErrorCode.HResult.ToString("X8")));
+                    else if (st == Windows.Foundation.AsyncStatus.Error)
+                    {
+                        int hr = o.ErrorCode.HResult;
+                        string msg = "OCR hatası: 0x" + hr.ToString("X8");
+                        tcs.TrySetException(hr == unchecked((int)0x80004004) ? new OcrAbortedException(msg) : new Exception(msg));
+                    }
                     else tcs.TrySetCanceled();
                 }
                 catch (Exception ex) { tcs.TrySetException(ex); }
@@ -517,14 +530,26 @@ namespace SecCevir
                 finally { b.UnlockBits(d); }
             }
 
-            Windows.Media.Ocr.OcrResult r;
-            using (Windows.Graphics.Imaging.SoftwareBitmap sb = Windows.Graphics.Imaging.SoftwareBitmap.CreateCopyFromBuffer(
-                Windows.Security.Cryptography.CryptographicBuffer.CreateFromByteArray(pixels),
-                Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8, w, h,
-                Windows.Graphics.Imaging.BitmapAlphaMode.Premultiplied))
+            // Aynı motora aynı anda iki okuma gelirse biri 0x80004004 (E_ABORT) ile iptal ediliyor
+            // (denendi: 6 paralel okumanın 3'ü). Okumalar sıraya konur; iptal olursa bir kez daha denenir.
+            Windows.Media.Ocr.OcrResult r = null;
+            await gate.WaitAsync();
+            try
             {
-                r = await Wait(e.RecognizeAsync(sb));
+                for (int attempt = 0; r == null; attempt++)
+                {
+                    using (Windows.Graphics.Imaging.SoftwareBitmap sb = Windows.Graphics.Imaging.SoftwareBitmap.CreateCopyFromBuffer(
+                        Windows.Security.Cryptography.CryptographicBuffer.CreateFromByteArray(pixels),
+                        Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8, w, h,
+                        Windows.Graphics.Imaging.BitmapAlphaMode.Premultiplied))
+                    {
+                        try { r = await Wait(e.RecognizeAsync(sb)); }
+                        catch (OcrAbortedException) { if (attempt >= 1) throw; }
+                    }
+                    if (r == null) await Task.Delay(150);
+                }
             }
+            finally { gate.Release(); }
 
             StringBuilder text = new StringBuilder();
             foreach (Windows.Media.Ocr.OcrLine line in r.Lines)

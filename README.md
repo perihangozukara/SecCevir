@@ -35,13 +35,14 @@ Program küçük ve yeni olduğu için Windows ilk açılışta mavi bir uyarı 
 - **Her yerde çalışır.** Yalnızca internet tarayıcısında değil; programlarda, pencerelerde ve terminalde de çalışır. Terminalde çalışan komutu kesmez.
 - **Yaz-Çevir.** Saatin yanındaki simgeye tıkla ya da `Ctrl+Alt+T` tuşlarına bas. Türkçe bir cümle yaz, İngilizcesi çıkar. İngilizce yazarsan Türkçesi çıkar. `Ctrl+Enter` kopyalar ve pencereyi kapatır, `Esc` kapatır.
 - **✨ Doğal İngilizce.** Yaz-Çevir penceresinde, yazdığın cümleyi Claude'a daha doğal bir İngilizceye çevirtir ve neyi değiştirdiğini kısa bir Türkçe notla söyler. Bunun için bilgisayarında [Claude Code](https://claude.com/claude-code) kurulu ve giriş yapılmış olmalıdır. Diğer her şey onsuz çalışır.
+- **Ekrandan oku.** Seçilemeyen yazılar için (taranmış PDF, resim, video): `Ctrl+Alt+O` tuşlarına bas, ekran kararır; okunacak yerin çevresine fareyle bir dikdörtgen çiz. Windows'un kendi yazı tanıma özelliği (OCR) yazıyı okur, Türkçesi her zamanki kutuda çıkar. Kutuda okunan İngilizce de görünür; okuma hatası varsa fark edersin. `Esc` vazgeçer. En iyi sonuç için Windows'ta İngilizce dil paketi kurulu olmalı.
 - **Kopyala.** Çeviri kutusundaki 📋 düğmesi Türkçe çeviriyi kopyalar.
 - **Sesli okur.** 🔊 düğmesi yazıyı sesli okur.
 - **Aç / kapat.** Simgeye sağ tıkla: "Seçince çevir" ile açıp kapatabilir, "Windows ile başlat" ile bilgisayar açılınca kendiliğinden başlamasını sağlayabilirsin.
 
 ## Gizlilik
 
-Seçtiğin yazı, çevrilmek üzere Google Çeviri'ye gönderilir. Gizli yazılarda kullanma.
+Seçtiğin yazı, çevrilmek üzere Google Çeviri'ye gönderilir. Gizli yazılarda kullanma. Ekrandan okumada ekran görüntüsü bilgisayarında kalır, diske kaydedilmez; yalnızca okunan yazı çeviriye gider.
 
 ## Sorun olursa
 
@@ -72,6 +73,7 @@ Get `SecCevir.exe` from the [latest release](https://github.com/perihangozukara/
 - Works in terminals too (Windows Terminal, console, Git Bash, PuTTY) without sending Ctrl+C, so running commands are never interrupted. The selection is read through UI Automation, or from the clipboard when the terminal copies on select.
 - **Type & translate:** click the tray icon (or press Ctrl+Alt+T anywhere), type a Turkish sentence and get its English translation (English input is translated to Turkish). Copy button, Ctrl+Enter copies and closes, Esc closes.
 - **✨ Make it natural:** in the type & translate window, asks Claude (Claude Haiku 5.5) for natural English, with a short Turkish note on what changed. If you type English, it corrects your English. It runs through the locally installed Claude Code (`claude -p`) with your existing Claude subscription login; no API key is used or passed on, so it never bills the paid API.
+- **Read from screen (OCR):** for text that cannot be selected (scanned PDFs, images, videos), press Ctrl+Alt+O anywhere, the screen dims, and drag a rectangle around the text. It is read with the OCR built into Windows (Windows.Media.Ocr; offline, no extra package), lines are joined (end-of-line hyphens removed) and translated in the usual popup, which also shows the recognized English so OCR mistakes are easy to spot. Esc cancels. Best results need the English OCR language installed in Windows; otherwise the first installed OCR language is used.
 - The selection popup has a copy button for the Turkish translation
 - Works from the system tray; can be switched on/off and set to start with Windows
 - Can read the text aloud
@@ -84,6 +86,6 @@ Run `derle.bat` (uses the C# compiler that ships with Windows / .NET Framework 4
 The app writes skip reasons to `SecCevir.log` next to the exe (never the selected text). Create an empty `SecCevir.debug` file there for step-by-step logging.
 
 ## Privacy
-The selected text is sent to Google Translate to get the translation. Do not use it on confidential text.
+The selected text is sent to Google Translate to get the translation. Do not use it on confidential text. For read-from-screen, the screenshot stays in memory and is never saved to disk; only the recognized text is sent for translation.
 
 Built with the help of an AI coding assistant as part of my learning journey.

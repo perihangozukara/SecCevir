@@ -1,6 +1,8 @@
 ﻿// Seç-Çevir: ekranda fareyle seçilen İngilizce metnin Türkçesini seçimin altında gösterir.
 // Terminallerde tuş göndermeden çalışır. Simgeye tıklayınca (ya da Ctrl+Alt+T) açılan
 // Yaz-Çevir penceresinde Türkçe yazılan cümlenin İngilizcesi çıkar ve kopyalanır.
+// Ctrl+Alt+O: ekrandan oku. Seçilemeyen yazı (taranmış PDF, resim) dikdörtgenle
+// işaretlenir, Windows'un yerleşik OCR'ı ile okunur ve çevrilir.
 // Derleme: derle.bat
 using System;
 using System.Collections.Generic;
@@ -215,32 +217,331 @@ namespace SecCevir
         public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
         public const int WM_HOTKEY = 0x312;
         public const uint MOD_ALT = 1, MOD_CONTROL = 2, MOD_NOREPEAT = 0x4000;
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+        [DllImport("kernel32.dll")]
+        static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        static extern bool QueryFullProcessImageName(IntPtr h, int flags, StringBuilder name, ref int size);
+
+        // Öndeki pencerenin programı (uzantısız, küçük harf; ör. "snippingtool"). Bulunamazsa "".
+        public static string ForegroundProcessName()
+        {
+            try
+            {
+                uint pid;
+                GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+                if (pid == 0) return "";
+                IntPtr h = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
+                if (h == IntPtr.Zero) return "";
+                try
+                {
+                    StringBuilder sb = new StringBuilder(1024);
+                    int size = sb.Capacity;
+                    if (!QueryFullProcessImageName(h, 0, sb, ref size)) return "";
+                    return Path.GetFileNameWithoutExtension(sb.ToString()).ToLowerInvariant();
+                }
+                finally { CloseHandle(h); }
+            }
+            catch { return ""; }
+        }
     }
 
-    // Her yerden çalışan kısayol tuşu (Ctrl+Alt+T). Başka bir program aynı tuşu
-    // almışsa kurulamaz; o zaman yalnızca simgeye tıklamak çalışır.
+    // Her yerden çalışan kısayol tuşları: Ctrl+Alt+T (Yaz-Çevir), Ctrl+Alt+O (ekrandan oku).
+    // Başka bir program aynı tuşu almışsa kurulamaz; o zaman yalnızca menü çalışır.
     class HotkeyWindow : NativeWindow
     {
-        readonly Action onPress;
-        public readonly bool Ok;
+        readonly Action onWrite, onOcr;
+        public readonly bool Ok, OcrOk;
 
-        public HotkeyWindow(Action onPress)
+        public HotkeyWindow(Action onWrite, Action onOcr)
         {
-            this.onPress = onPress;
+            this.onWrite = onWrite;
+            this.onOcr = onOcr;
             CreateHandle(new CreateParams());
-            Ok = Native.RegisterHotKey(Handle, 1, Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_NOREPEAT, (uint)Keys.T);
+            uint mods = Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_NOREPEAT;
+            Ok = Native.RegisterHotKey(Handle, 1, mods, (uint)Keys.T);
+            OcrOk = Native.RegisterHotKey(Handle, 2, mods, (uint)Keys.O);
         }
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == Native.WM_HOTKEY) { try { onPress(); } catch { } }
+            if (m.Msg == Native.WM_HOTKEY)
+            {
+                int id = m.WParam.ToInt32();
+                try { if (id == 1) onWrite(); else if (id == 2) onOcr(); } catch { }
+            }
             base.WndProc(ref m);
         }
 
         public void Dispose()
         {
             if (Ok) Native.UnregisterHotKey(Handle, 1);
+            if (OcrOk) Native.UnregisterHotKey(Handle, 2);
             DestroyHandle();
+        }
+    }
+
+    // Ekrandan oku: ekran kararır, fareyle dikdörtgen çizilir. Ekranın görüntüsü pencere
+    // açılmadan önce alınır ve yalnızca bellekte durur; diske yazılmaz.
+    // Esc, sağ tık ya da başka pencereye geçmek vazgeçer.
+    class SnipForm : Form
+    {
+        readonly Bitmap shot, dark;
+        readonly float scale;
+        Point start;
+        Rectangle sel;
+        bool dragging;
+        public Bitmap Result;          // seçilen alanın görüntüsü (vazgeçilirse null)
+        public Rectangle Selection;    // seçilen alan, ekran koordinatlarında
+
+        public SnipForm(Bitmap shot, Rectangle screen)
+        {
+            this.shot = shot;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            AutoScaleMode = AutoScaleMode.None;
+            TopMost = true;
+            DoubleBuffered = true;
+            KeyPreview = true;
+            Cursor = Cursors.Cross;
+            BackColor = Color.Black;
+            Bounds = screen;
+            using (Graphics g = CreateGraphics()) scale = g.DpiX / 96f;
+
+            // Kararmış kopya bir kez hazırlanır; seçilen alan özgün görüntüden aydınlık çizilir.
+            dark = new Bitmap(shot.Width, shot.Height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+            using (Graphics g = Graphics.FromImage(dark))
+            {
+                g.DrawImageUnscaled(shot, 0, 0);
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(150, 5, 12, 25)))
+                    g.FillRectangle(b, 0, 0, dark.Width, dark.Height);
+            }
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x80; // WS_EX_TOOLWINDOW: Alt+Tab listesinde görünmez
+                return cp;
+            }
+        }
+
+        Rectangle Norm(Point a, Point b)
+        {
+            Rectangle r = Rectangle.FromLTRB(Math.Min(a.X, b.X), Math.Min(a.Y, b.Y), Math.Max(a.X, b.X), Math.Max(a.Y, b.Y));
+            return Rectangle.Intersect(r, ClientRectangle);
+        }
+
+        void Redraw(Rectangle old)
+        {
+            Rectangle r = Rectangle.Union(old, sel);
+            r.Inflate(4, 4);
+            Invalidate(r);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Right) { Close(); return; }
+            if (e.Button != MouseButtons.Left) return;
+            dragging = true;
+            start = e.Location;
+            sel = Rectangle.Empty;
+            Invalidate();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            if (!dragging) return;
+            Rectangle old = sel;
+            sel = Norm(start, e.Location);
+            Redraw(old);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left || !dragging) return;
+            dragging = false;
+            sel = Norm(start, e.Location);
+            if (sel.Width >= 8 && sel.Height >= 8)
+            {
+                Result = shot.Clone(sel, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                Selection = new Rectangle(sel.X + Left, sel.Y + Top, sel.Width, sel.Height);
+            }
+            Close();
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Escape) { e.Handled = true; Close(); }
+            base.OnKeyDown(e);
+        }
+
+        protected override void OnDeactivate(EventArgs e)
+        {
+            base.OnDeactivate(e);
+            if (!IsDisposed) Close();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.DrawImage(dark, e.ClipRectangle, e.ClipRectangle, GraphicsUnit.Pixel);
+            if (sel.Width > 0 && sel.Height > 0)
+            {
+                g.DrawImage(shot, sel, sel, GraphicsUnit.Pixel);
+                using (Pen p = new Pen(Theme.Gold, Math.Max(1f, 2 * scale)))
+                    g.DrawRectangle(p, sel.X - 1, sel.Y - 1, sel.Width + 1, sel.Height + 1);
+            }
+            else if (!dragging)
+            {
+                // İpucu, farenin bulunduğu ekranın üst ortasında.
+                Rectangle scr = Screen.FromPoint(Cursor.Position).Bounds;
+                scr.Offset(-Left, -Top);
+                string hint = "Okunacak alanı fareyle çizin  ·  Esc: vazgeç";
+                using (Font f = new Font("Segoe UI Semibold", 11f))
+                {
+                    Size sz = TextRenderer.MeasureText(hint, f);
+                    Rectangle box = new Rectangle(scr.Left + (scr.Width - sz.Width) / 2 - (int)(16 * scale),
+                        scr.Top + (int)(40 * scale), sz.Width + (int)(32 * scale), sz.Height + (int)(16 * scale));
+                    using (SolidBrush b = new SolidBrush(Theme.Window)) g.FillRectangle(b, box);
+                    using (Pen p = new Pen(Theme.Gold)) g.DrawRectangle(p, box);
+                    TextRenderer.DrawText(g, hint, f, box, Theme.GoldLight,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                }
+            }
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            dark.Dispose();
+            base.OnFormClosed(e);
+        }
+    }
+
+    // Ekrandan oku: Windows'un yerleşik OCR'ı (Windows.Media.Ocr). İnternet ve paket gerekmez.
+    // Görüntü yalnızca bellekte tutulur, diske yazılmaz.
+    static class OcrReader
+    {
+        static Windows.Media.Ocr.OcrEngine engine;
+        public static string LanguageTag = "";
+
+        // Önce İngilizce okuyucu; yoksa Windows'ta yüklü ilk dil (Latin harfli İngilizceyi de okur).
+        static Windows.Media.Ocr.OcrEngine Engine()
+        {
+            if (engine != null) return engine;
+            foreach (string tag in new string[] { "en-US", "en-GB", "en" })
+            {
+                try
+                {
+                    Windows.Globalization.Language lang = new Windows.Globalization.Language(tag);
+                    if (Windows.Media.Ocr.OcrEngine.IsLanguageSupported(lang))
+                    {
+                        engine = Windows.Media.Ocr.OcrEngine.TryCreateFromLanguage(lang);
+                        if (engine != null) { LanguageTag = lang.LanguageTag; return engine; }
+                    }
+                }
+                catch { }
+            }
+            foreach (Windows.Globalization.Language lang in Windows.Media.Ocr.OcrEngine.AvailableRecognizerLanguages)
+            {
+                engine = Windows.Media.Ocr.OcrEngine.TryCreateFromLanguage(lang);
+                if (engine != null) { LanguageTag = lang.LanguageTag; return engine; }
+            }
+            return null;
+        }
+
+        public static bool IsEnglish { get { return LanguageTag.StartsWith("en", StringComparison.OrdinalIgnoreCase); } }
+
+        // Küçük yazı daha iyi okunsun diye görüntü iki kat büyütülür (OCR sınırını aşmadan).
+        static Bitmap Prepare(Bitmap src)
+        {
+            int max = (int)Windows.Media.Ocr.OcrEngine.MaxImageDimension;
+            double f = 1;
+            if (src.Height < 600 && src.Width < 1500) f = 2;
+            if (src.Width * f > max) f = (double)max / src.Width;
+            if (src.Height * f > max) f = Math.Min(f, (double)max / src.Height);
+            int w = Math.Max(1, (int)(src.Width * f)), h = Math.Max(1, (int)(src.Height * f));
+            Bitmap b = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(b))
+            {
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                g.DrawImage(src, new Rectangle(0, 0, w, h));
+            }
+            return b;
+        }
+
+        // WinRT işleminin bitmesini bekler. (Hazır await yardımcısı SDK'nın Windows.winmd
+        // dosyasını istiyor; o olmadan derlensin diye Completed olayıyla beklenir.)
+        static Task<T> Wait<T>(Windows.Foundation.IAsyncOperation<T> op)
+        {
+            TaskCompletionSource<T> tcs = new TaskCompletionSource<T>();
+            op.Completed = delegate(Windows.Foundation.IAsyncOperation<T> o, Windows.Foundation.AsyncStatus st)
+            {
+                try
+                {
+                    if (st == Windows.Foundation.AsyncStatus.Completed) tcs.TrySetResult(o.GetResults());
+                    else if (st == Windows.Foundation.AsyncStatus.Error) tcs.TrySetException(new Exception("OCR hatası: 0x" + o.ErrorCode.HResult.ToString("X8")));
+                    else tcs.TrySetCanceled();
+                }
+                catch (Exception ex) { tcs.TrySetException(ex); }
+            };
+            return tcs.Task;
+        }
+
+        // Görüntüdeki yazıyı okur. Satırlar birleştirilir: satır sonundaki tire silinir
+        // ("transla-" + "tion" → "translation"), diğer satırlar araya boşlukla eklenir.
+        public static async Task<string> Read(Bitmap image)
+        {
+            Windows.Media.Ocr.OcrEngine e = Engine();
+            if (e == null) throw new InvalidOperationException("Windows'ta OCR dili yüklü değil");
+
+            byte[] pixels;
+            int w, h;
+            using (Bitmap b = Prepare(image))
+            {
+                w = b.Width; h = b.Height;
+                System.Drawing.Imaging.BitmapData d = b.LockBits(new Rectangle(0, 0, w, h),
+                    System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                try
+                {
+                    pixels = new byte[w * h * 4];
+                    for (int y = 0; y < h; y++)
+                        Marshal.Copy(IntPtr.Add(d.Scan0, y * d.Stride), pixels, y * w * 4, w * 4);
+                }
+                finally { b.UnlockBits(d); }
+            }
+
+            Windows.Media.Ocr.OcrResult r;
+            using (Windows.Graphics.Imaging.SoftwareBitmap sb = Windows.Graphics.Imaging.SoftwareBitmap.CreateCopyFromBuffer(
+                Windows.Security.Cryptography.CryptographicBuffer.CreateFromByteArray(pixels),
+                Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8, w, h,
+                Windows.Graphics.Imaging.BitmapAlphaMode.Premultiplied))
+            {
+                r = await Wait(e.RecognizeAsync(sb));
+            }
+
+            StringBuilder text = new StringBuilder();
+            foreach (Windows.Media.Ocr.OcrLine line in r.Lines)
+            {
+                string s = line.Text.Trim();
+                if (s.Length == 0) continue;
+                if (text.Length > 0)
+                {
+                    int n = text.Length;
+                    bool hyphen = n >= 2 && (text[n - 1] == '-' || text[n - 1] == '­')
+                                  && char.IsLetter(text[n - 2]) && char.IsLower(s[0]);
+                    if (hyphen) text.Length = n - 1;
+                    else text.Append(' ');
+                }
+                text.Append(s);
+            }
+            return Regex.Replace(text.ToString(), @"\s+", " ").Trim();
         }
     }
 
@@ -794,6 +1095,7 @@ namespace SecCevir
         readonly WriteForm writer;
         readonly HotkeyWindow hotkey;
         uint seqAtDown;
+        string procAtDown = "";
         static readonly HttpClient http = MakeHttp();
         readonly string mp3Path = Path.Combine(Path.GetTempPath(), "seccevir_ses.mp3");
 
@@ -821,14 +1123,19 @@ namespace SecCevir
             popup.SpeakClicked += delegate { Speak(currentText, currentLang); };
 
             writer = new WriteForm(TranslateForWriter, Naturalize, Speak, SpeechState, PauseSpeech, ResumeSpeech);
-            hotkey = new HotkeyWindow(delegate { writer.ShowNear(); });
+            hotkey = new HotkeyWindow(delegate { writer.ShowNear(); }, StartOcr);
             if (!hotkey.Ok) Log("Ctrl+Alt+T kısayolu kurulamadı (başka bir program kullanıyor olabilir)");
+            if (!hotkey.OcrOk) Log("Ctrl+Alt+O kısayolu kurulamadı (başka bir program kullanıyor olabilir)");
 
             ContextMenuStrip menu = new ContextMenuStrip();
             ToolStripMenuItem write = new ToolStripMenuItem(hotkey.Ok ? "Yaz-Çevir  (Ctrl+Alt+T)" : "Yaz-Çevir");
             write.Font = new Font(write.Font, FontStyle.Bold);
             write.Click += delegate { writer.ShowNear(); };
             menu.Items.Add(write);
+            ToolStripMenuItem ocr = new ToolStripMenuItem(hotkey.OcrOk ? "Ekrandan oku  (Ctrl+Alt+O)" : "Ekrandan oku");
+            // Menü kapanıp ekran yeniden çizilsin diye kısa bir an beklenir.
+            ocr.Click += delegate { Timer t = new Timer(); t.Interval = 250; t.Tick += delegate { t.Dispose(); StartOcr(); }; t.Start(); };
+            menu.Items.Add(ocr);
             menu.Items.Add(new ToolStripSeparator());
             ToolStripMenuItem onOff = new ToolStripMenuItem("Seçince çevir");
             onOff.Checked = true;
@@ -874,7 +1181,7 @@ namespace SecCevir
             };
             tray.Visible = true;
             tray.ShowBalloonTip(3000, "Seç-Çevir çalışıyor",
-                "İngilizce metni seçin: Türkçesi çıkar. Simgeye tıklayın: Türkçe yazın, İngilizcesini kopyalayın.",
+                "İngilizce metni seçin: Türkçesi çıkar. Simgeye tıklayın: Türkçe yazın, İngilizcesini kopyalayın. Seçilemeyen yazı için Ctrl+Alt+O.",
                 ToolTipIcon.Info);
 
             // Kancadan hemen dön; işi arayüzün mesaj kuyruğuna bırak ki fare takılmasın.
@@ -926,6 +1233,10 @@ namespace SecCevir
 
         void OnMouse(int msg, Point pt)
         {
+            // Ekrandan oku dikdörtgeni çizilirken (ve kapandıktan hemen sonra) fare olayları
+            // seçim sayılmaz; yoksa bırakınca alttaki pencereye Ctrl+C gönderilirdi.
+            if (snip != null || DateTime.UtcNow < ignoreMouseUntil) return;
+
             bool inPopup = popup.Visible && popup.Bounds.Contains(pt);
 
             if (msg == Native.WM_RBUTTONDOWN || msg == Native.WM_MOUSEWHEEL)
@@ -944,6 +1255,8 @@ namespace SecCevir
                     // "Seçince kopyalayan" terminaller (Git Bash, PuTTY) panoyu bırakınca
                     // değiştirir; değişip değişmediğini anlamak için şimdiki sırayı sakla.
                     seqAtDown = Native.GetClipboardSequenceNumber();
+                    // Sürükleme bir ekran görüntüsü aracında başladıysa bırakınca anlaşılsın.
+                    procAtDown = Native.ForegroundProcessName();
                 }
                 return;
             }
@@ -989,6 +1302,16 @@ namespace SecCevir
         {
             return cls == "CabinetWClass" || cls == "ExploreWClass"
                 || cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd";
+        }
+
+        // Ekran görüntüsü araçlarında fareyle alan seçilir; bu bir metin seçimi değildir.
+        // Araç görüntüyü panoya yazarken Ctrl+C gönderip panoyu "eski haline" döndürmek
+        // görüntüyü siler. Bu yüzden bu araçlarda hiçbir şey yapılmaz.
+        static bool IsScreenshotTool(string proc)
+        {
+            return proc == "snippingtool" || proc == "screenclippinghost" || proc == "screensketch"
+                || proc == "sharex" || proc == "greenshot" || proc == "lightshot"
+                || proc == "snagit32" || proc == "flameshot" || proc == "picpick";
         }
 
         // Yaz-Çevir penceresinde yapılan seçimler çevrilmez.
@@ -1039,6 +1362,14 @@ namespace SecCevir
             return null;
         }
 
+        // Terminal dışındaki uygulamalarda yedek yol: en fazla 1,5 sn bekler.
+        static async Task<string> ReadSelectionByUia(Point pt)
+        {
+            Task<string> uia = Task.Run(delegate { return UiaReader.ReadSelection(pt, MaxChars * 2); });
+            if (await Task.WhenAny(uia, Task.Delay(1500)) != uia) return null;
+            return uia.Status == TaskStatus.RanToCompletion ? uia.Result : null;
+        }
+
         static async Task<string> ReadClipboardText()
         {
             for (int j = 0; j < 6; j++)
@@ -1050,19 +1381,22 @@ namespace SecCevir
             return null;
         }
 
-        // Metindeki Türkçeye özgü harflerin oranı. İngilizce bir metinde tek bir Türkçe
-        // ad (ör. bir yer ya da dosya adı) geçmesi metni Türkçe yapmaz.
-        static bool LooksTurkish(string text)
+        // Kelimelerin yüzde kaçında Türkçeye özgü harf (ç ğ ı İ ö ş ü) var. Harf yerine kelime
+        // sayılır: İngilizce bir cümlede tek bir Türkçe ad ya da kelime geçmesi metni Türkçe
+        // yapmaz (eskiden tek bir "ş" bile kısa bir İngilizce metni atlatıyordu).
+        static int TurkishWordPercent(string text)
         {
-            int letters = 0, tr = 0;
-            foreach (char c in text)
+            int words = 0, tr = 0;
+            foreach (Match m in Regex.Matches(text, @"\p{L}{2,}"))
             {
-                if (!char.IsLetter(c)) continue;
-                letters++;
-                if ("çÇğĞıİöÖşŞüÜ".IndexOf(c) >= 0) tr++;
+                words++;
+                if (m.Value.IndexOfAny("çÇğĞıİöÖşŞüÜ".ToCharArray()) >= 0) tr++;
             }
-            return letters > 0 && tr * 100 >= letters * 2; // en az %2
+            return words == 0 ? 0 : tr * 100 / words;
         }
+
+        // Türkçe bir cümlede kelimelerin aşağı yukarı üçte biri bu harfleri taşır.
+        static bool LooksTurkish(string text) { return TurkishWordPercent(text) >= 25; }
 
         static bool KeyDown(int vk) { return (Native.GetAsyncKeyState(vk) & 0x8000) != 0; }
 
@@ -1080,15 +1414,31 @@ namespace SecCevir
             return false;
         }
 
+        // Önceki seçim hâlâ okunurken yeni bir seçim gelirse atılmaz; sıraya konur ve
+        // önceki bitince okunur (yalnızca en sonuncusu).
+        Action pendingCapture;
+
         async void Capture(Point at, int topY, Point upPt)
         {
-            if (busy) { Log("atlandı: önceki seçim hâlâ kopyalanıyor"); return; }
+            if (busy)
+            {
+                Debug("sıraya kondu: önceki seçim hâlâ okunuyor");
+                pendingCapture = delegate { Capture(at, topY, upPt); };
+                return;
+            }
             busy = true;
             string text;
+            string cls = "", procNow = "";
             try
             {
                 await Task.Delay(150);
-                string cls = ForegroundClass();
+                procNow = Native.ForegroundProcessName();
+                if (IsScreenshotTool(procAtDown) || IsScreenshotTool(procNow))
+                {
+                    Log("atlandı: ekran görüntüsü aracı (" + (IsScreenshotTool(procAtDown) ? procAtDown : procNow) + ")");
+                    return;
+                }
+                cls = ForegroundClass();
                 if (IsSkipped(cls)) { Debug("atlandı: pencere " + cls); return; }
                 if (IsOwnForeground()) return;
                 if (IsTerminal(cls))
@@ -1101,28 +1451,160 @@ namespace SecCevir
                 {
                     if (!await WaitModifiersReleased()) { Log("atlandı: Shift/Ctrl/Alt tuşu bırakılmadı"); return; }
 
+                    // Sürükleme sırasında pano değiştiyse onu başka bir program yazdı (ör. tanımadığımız
+                    // bir ekran görüntüsü aracı). Ctrl+C gönderip panoyu geri yüklemek o veriyi silerdi.
+                    if (Native.GetClipboardSequenceNumber() != seqAtDown)
+                    {
+                        Log("atlandı: pano seçim sırasında başka bir programca değişti (" + procNow + ")");
+                        return;
+                    }
+
+                    // Beklerken öne bir terminal geldiyse ona asla Ctrl+C gönderme (komutu keser).
+                    if (IsTerminal(ForegroundClass())) { Log("atlandı: beklerken öne terminal geldi"); return; }
                     text = await CopySelection();
-                    if (text == null)
+                    if (text == null && !IsTerminal(ForegroundClass()))
                     {
                         // Bazı uygulamalar seçimi geç tamamlar; bir kez daha dene.
                         await Task.Delay(200);
-                        text = await CopySelection();
+                        if (!IsTerminal(ForegroundClass())) text = await CopySelection();
                     }
-                    if (text == null) { Log("atlandı: uygulama Ctrl+C'ye metin vermedi (" + ForegroundClass() + ")"); return; }
+                    if (text == null)
+                    {
+                        // Ctrl+C metin vermedi: seçimi UI Automation ile (ekran okuyucuların yolu)
+                        // okumayı dene. Chrome, Qt ve WinUI uygulamaları seçimi bu yolla da verir.
+                        text = await ReadSelectionByUia(upPt);
+                        if (!string.IsNullOrEmpty(text)) Log("UI Automation ile okundu (" + procNow + ")");
+                    }
+                    if (string.IsNullOrEmpty(text))
+                    {
+                        Log("atlandı: uygulama seçili metin vermedi (" + procNow + " / " + cls + ")");
+                        return;
+                    }
                 }
             }
             catch (Exception ex) { Log("hata (kopyalama): " + ex.Message); return; }
-            finally { busy = false; }
+            finally
+            {
+                busy = false;
+                Action next = pendingCapture;
+                pendingCapture = null;
+                if (next != null) popup.BeginInvoke(next);
+            }
 
             text = Regex.Replace(text, @"\s+", " ").Trim();
             Debug("kopyalandı: " + text.Length + " karakter");
-            if (text.Length == 0 || !Regex.IsMatch(text, "[A-Za-z]")) { Log("atlandı: seçimde harf yok"); return; }
+            ShowTranslation(text, at, topY, false);
+        }
+
+        // Ekrandan oku (Ctrl+Alt+O). Önce ekranın görüntüsü bellekte alınır, sonra kararmış
+        // hâli tam ekran gösterilir; çizilen alan OCR ile okunup her zamanki kutuda çevrilir.
+        SnipForm snip;
+        DateTime ignoreMouseUntil = DateTime.MinValue;
+        bool ocrBusy;
+
+        void StartOcr()
+        {
+            if (snip != null || ocrBusy) return;
+            popup.Hide();
+            Rectangle vs = SystemInformation.VirtualScreen;
+            Bitmap shot;
+            try
+            {
+                shot = new Bitmap(vs.Width, vs.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                using (Graphics g = Graphics.FromImage(shot)) g.CopyFromScreen(vs.Location, Point.Empty, vs.Size);
+            }
+            catch (Exception ex) { Log("hata (ekran görüntüsü): " + ex.Message); return; }
+
+            SnipForm f = new SnipForm(shot, vs);
+            snip = f;
+            f.FormClosed += delegate
+            {
+                Bitmap crop = f.Result;
+                Rectangle r = f.Selection;
+                snip = null;
+                ignoreMouseUntil = DateTime.UtcNow.AddMilliseconds(500);
+                popup.BeginInvoke(new Action(delegate { f.Dispose(); shot.Dispose(); }));
+                if (crop != null) ReadScreen(crop, r);
+                else Debug("OCR: vazgeçildi");
+            };
+            f.Show();
+            f.Activate();
+        }
+
+        async void ReadScreen(Bitmap crop, Rectangle r)
+        {
+            ocrBusy = true;
+            Point at = new Point(r.Left, r.Bottom + 8);
+            int topY = r.Top - 8;
+            int id = ++requestId;
+            popup.ShowAt(at, topY, "Ekrandan okunuyor…", "…");
+            string text;
+            try { text = await Task.Run(delegate { return OcrReader.Read(crop); }); }
+            catch (Exception ex)
+            {
+                Log("hata (OCR): " + ex.Message);
+                if (id == requestId) popup.ShowAt(at, topY, "", "Ekrandaki yazı okunamadı (" + ex.Message + ").");
+                return;
+            }
+            finally { crop.Dispose(); ocrBusy = false; }
+
+            if (!OcrReader.IsEnglish && !ocrLangLogged)
+            {
+                ocrLangLogged = true;
+                Log("OCR: İngilizce dil paketi yok, " + OcrReader.LanguageTag + " okuyucusu kullanılıyor");
+            }
+            if (id != requestId) return;
+            if (text.Length == 0)
+            {
+                Log("OCR: alanda yazı bulunamadı");
+                popup.ShowAt(at, topY, "", "Bu alanda yazı bulunamadı. Biraz daha geniş bir alan çizip tekrar deneyin.");
+                return;
+            }
+            Log("OCR: okundu (" + text.Length + " karakter)");
+            ShowTranslation(FixOcrLetters(text), at, topY, true);
+        }
+
+        bool ocrLangLogged;
+
+        // İngilizce dil paketi yoksa Türkçe okuyucu kullanılır; o da İngilizce bir kelimedeki
+        // "i"yi "ı", "e"yi lekeyle "ş" gibi okuyabilir. Metin Türkçe değilse bu harfler
+        // İngilizcedeki karşılığına çevrilir.
+        static string FixOcrLetters(string text)
+        {
+            if (OcrReader.IsEnglish || LooksTurkish(text)) return text;
+            StringBuilder sb = new StringBuilder(text.Length);
+            const string from = "çÇğĞıİöÖşŞüÜ", to = "cCgGiIoOsSuU";
+            foreach (char c in text)
+            {
+                int k = from.IndexOf(c);
+                sb.Append(k >= 0 ? to[k] : c);
+            }
+            return sb.ToString();
+        }
+
+        // Okunan metni kutuda gösterip Türkçeye çevirir. Fareyle seçimde sorunlu metin sessizce
+        // atlanır; ekrandan okumada (ocr) kullanıcı bilerek istediği için kutuda nedeni yazılır.
+        async void ShowTranslation(string text, Point at, int topY, bool ocr)
+        {
+            if (text.Length == 0 || !Regex.IsMatch(text, "[A-Za-z]"))
+            {
+                Log("atlandı: seçimde harf yok");
+                if (ocr) popup.ShowAt(at, topY, text, "Okunan alanda çevrilecek yazı yok.");
+                return;
+            }
             // Türkçe harfler çoksa metin zaten Türkçedir, çevirmeye gerek yok.
-            if (LooksTurkish(text)) { Log("atlandı: metin Türkçe görünüyor (" + text.Length + " karakter)"); return; }
+            if (LooksTurkish(text))
+            {
+                Log("atlandı: metin Türkçe görünüyor (" + text.Length + " karakter)");
+                if (ocr) popup.ShowAt(at, topY, text.Length > 300 ? text.Substring(0, 300) + "…" : text, "Okunan metin zaten Türkçe görünüyor.");
+                return;
+            }
 
             bool cut = text.Length > MaxChars;
             if (cut) text = text.Substring(0, MaxChars);
-            string shown = text.Length > 300 ? text.Substring(0, 300) + "…" : text;
+            // Ekrandan okumada OCR hatası fark edilsin diye okunan metnin daha çoğu gösterilir.
+            int showMax = ocr ? 600 : 300;
+            string shown = text.Length > showMax ? text.Substring(0, showMax) + "…" : text;
 
             // Çeviri beklenirken yeni seçimler engellenmesin diye busy burada serbest.
             currentText = text;
@@ -1150,11 +1632,25 @@ namespace SecCevir
             {
                 string[] res = await Translate(text, "tr");
                 Debug("çevrildi: dil=" + res[1] + " görünür=" + popup.Visible + " güncel=" + (id == requestId));
+                if (res[1] == "tr" && TurkishWordPercent(text) < 10)
+                {
+                    // Google "Türkçe" dedi ama kelimelerin neredeyse hiçbirinde Türkçe harf yok:
+                    // büyük olasılıkla araya Türkçe karışmış İngilizce (ör. terminal çıktısı).
+                    // Kaynak dili İngilizce diye zorlayıp bir kez daha çevir.
+                    string[] forced = await Translate(text, "tr", "en");
+                    bool same = string.Equals(forced[0].Trim(), text.Trim(), StringComparison.OrdinalIgnoreCase);
+                    Debug("Google Türkçe dedi; İngilizce zorlandı, değişti=" + !same);
+                    if (!same) res = new string[] { forced[0], "en" };
+                }
                 if (res[1] == "tr")
                 {
                     // Metin zaten Türkçeymiş: popup'ı kapat.
                     Log("atlandı: Google metni Türkçe saydı");
-                    if (id == requestId) popup.Hide();
+                    if (id == requestId)
+                    {
+                        if (ocr) popup.SetTranslation("Google bu metni Türkçe saydı; çevrilecek bir şey yok.");
+                        else popup.Hide();
+                    }
                     return;
                 }
                 if (cache.Count > 300) cache.Clear();
@@ -1256,6 +1752,14 @@ namespace SecCevir
             {
                 await Task.Delay(40);
                 try { if (Clipboard.ContainsText()) result = Clipboard.GetText(); } catch { }
+            }
+            // Metin gelmedi ama panoda görüntü var: bunu büyük olasılıkla bir ekran görüntüsü
+            // aracı tam bu sırada yazdı. Eski panoyu geri yüklemek görüntüyü silerdi; dokunma.
+            if (result == null)
+            {
+                bool image = false;
+                try { image = Clipboard.ContainsImage(); } catch { }
+                if (image) { Log("pano geri yüklenmedi: panoya görüntü geldi"); return null; }
             }
             try
             {
@@ -1443,17 +1947,18 @@ namespace SecCevir
 
         // Dönüş: [çeviri, Google'ın tanıdığı kaynak dil (ör. "en")]. tl: hedef dil ("tr" ya da "en").
         // Ana adres "çok fazla istek" (429) ya da başka bir hata verirse ikinci adres denenir.
-        static async Task<string[]> Translate(string text, string tl)
+        // sl: kaynak dil; "auto" ise Google kendisi tanır.
+        static async Task<string[]> Translate(string text, string tl, string sl = "auto")
         {
-            try { return await TranslateMain(text, tl); }
+            try { return await TranslateMain(text, tl, sl); }
             catch (TaskCanceledException) { throw; }
             catch (Exception ex) { Log("ana çeviri adresi: " + ex.Message + "; yedek adres deneniyor"); }
-            return await TranslateBackup(text, tl);
+            return await TranslateBackup(text, tl, sl);
         }
 
-        static async Task<string[]> TranslateBackup(string text, string tl)
+        static async Task<string[]> TranslateBackup(string text, string tl, string sl)
         {
-            string json = await Get("https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=" + tl + "&q="
+            string json = await Get("https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=" + sl + "&tl=" + tl + "&q="
                                     + Uri.EscapeDataString(text));
             // Biçim: [["çeviri","en"]] ya da ["çeviri"]
             object[] root = (object[])new JavaScriptSerializer().DeserializeObject(json);
@@ -1463,9 +1968,9 @@ namespace SecCevir
             return new string[] { (string)root[0], "en" };
         }
 
-        static async Task<string[]> TranslateMain(string text, string tl)
+        static async Task<string[]> TranslateMain(string text, string tl, string sl)
         {
-            string json = await Get("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=" + tl + "&dt=t&q="
+            string json = await Get("https://translate.googleapis.com/translate_a/single?client=gtx&sl=" + sl + "&tl=" + tl + "&dt=t&q="
                                     + Uri.EscapeDataString(text));
             object[] root = (object[])new JavaScriptSerializer().DeserializeObject(json);
             StringBuilder sb = new StringBuilder();
